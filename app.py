@@ -3,7 +3,8 @@ brand-governance - ad policy checker web app (backend + frontend in one file).
 Built by THE CIPHERERS (thecipherers@gmail.com).
 
 Run:
-    pip install flask google-genai          (free Gemini key)  and/or  anthropic
+    pip install flask google-genai pypdf pillow   (pypdf + pillow make it faster)
+    (for a Claude key instead: pip install flask anthropic pypdf pillow)
     set GEMINI_API_KEY=your-key             (or: set ANTHROPIC_API_KEY=your-key)
     python app.py
 Then open http://127.0.0.1:5000
@@ -12,9 +13,12 @@ The API key stays on your computer (server side). The browser never sees it.
 """
 
 import base64
+import hashlib
+import io
 import json
 import mimetypes
 import os
+import time
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
@@ -23,6 +27,10 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024  # 40 MB per request
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# Used automatically if the main model is slow, busy or fails.
+GEMINI_FALLBACK = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest")
+# Seconds to wait for ONE Gemini call before giving up on it.
+GEMINI_TIMEOUT_MS = int(float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "45")) * 1000)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -69,7 +77,52 @@ def provider():
     return None
 
 
-def read_upload(storage):
+_pdf_cache = {}
+
+
+def pdf_text(data):
+    """Extract text from a PDF (needs the optional 'pypdf' package). Cached."""
+    key = hashlib.sha256(data).hexdigest()
+    if key in _pdf_cache:
+        return _pdf_cache[key]
+    text = ""
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception:
+        text = ""
+    _pdf_cache[key] = text
+    return text
+
+
+def shrink_image(data, mime):
+    """Downscale very large images so uploads and AI reading are faster (needs optional 'pillow')."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return data, mime
+    try:
+        im = Image.open(io.BytesIO(data))
+        if max(im.size) <= 2000 and len(data) <= 3_000_000:
+            return data, mime
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            im = im.convert("RGBA")
+            flat = Image.new("RGB", im.size, (255, 255, 255))
+            flat.paste(im, mask=im.split()[-1])
+            im = flat
+        else:
+            im = im.convert("RGB")
+        im.thumbnail((2000, 2000))
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=88, optimize=True)
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        return data, mime
+
+
+def read_upload(storage, policy=False):
     """Return ('text', str) or ('file', bytes, mime) for an uploaded file."""
     name = storage.filename or ""
     suffix = Path(name).suffix.lower()
@@ -77,9 +130,16 @@ def read_upload(storage):
     if not data:
         raise UserError(f"{name} is empty.")
     if suffix == ".pdf":
+        # A rules PDF with real text is much faster to send as plain text.
+        if policy and os.environ.get("USE_PDF_TEXT", "1") != "0":
+            text = pdf_text(data)
+            if len(text) >= 200:
+                return ("text", text[:150000])
         return ("file", data, "application/pdf")
     if suffix in IMAGE_TYPES:
-        return ("file", data, mimetypes.guess_type(name)[0] or "image/png")
+        mime = mimetypes.guess_type(name)[0] or "image/png"
+        data, mime = shrink_image(data, mime)
+        return ("file", data, mime)
     if suffix in TEXT_TYPES:
         return ("text", data.decode("utf-8", errors="replace"))
     raise UserError(f"{name}: unsupported file type. Use PDF, PNG, JPG, GIF, WEBP, TXT or MD.")
@@ -114,8 +174,45 @@ def parse_result(text):
     return {"verdict": verdict, "checked": checked, "violations": clean}
 
 
-def run_gemini(policy, ad):
+def _gemini_client():
     from google import genai
+    from google.genai import types
+
+    key = os.environ["GEMINI_API_KEY"]
+    try:
+        # attempts=1 turns off the library's default of 5 slow automatic retries.
+        opts = types.HttpOptions(
+            timeout=GEMINI_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        )
+    except Exception:
+        try:
+            opts = types.HttpOptions(timeout=GEMINI_TIMEOUT_MS)
+        except Exception:
+            opts = None
+    return genai.Client(api_key=key, http_options=opts) if opts else genai.Client(api_key=key)
+
+
+def _gemini_call(client, model, contents, thinking):
+    from google.genai import types
+
+    cfg = {"system_instruction": SYSTEM_PROMPT, "response_mime_type": "application/json"}
+    if thinking:
+        cfg["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
+    response = client.models.generate_content(
+        model=model, contents=contents, config=types.GenerateContentConfig(**cfg)
+    )
+    return response.text
+
+
+def _is_config_error(e):
+    """True when the model rejected our settings (e.g. a thinking level it lacks)."""
+    if getattr(e, "code", None) == 400:
+        return True
+    return e.__class__.__name__ in ("ValidationError", "TypeError") or "thinking" in str(e).lower()
+
+
+def run_gemini(policy, ad):
     from google.genai import types
 
     def part(item):
@@ -123,22 +220,27 @@ def run_gemini(policy, ad):
             return item[1]
         return types.Part.from_bytes(data=item[1], mime_type=item[2])
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            "COMPANY POLICY DOCUMENT:",
-            part(policy),
-            "ADVERTISEMENT TO REVIEW:",
-            part(ad),
-            "Does the advertisement follow the policy? Reply with the JSON only.",
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-        ),
-    )
-    return response.text
+    contents = [
+        "COMPANY POLICY DOCUMENT:",
+        part(policy),
+        "ADVERTISEMENT TO REVIEW:",
+        part(ad),
+        "Does the advertisement follow the policy? Reply with the JSON only.",
+    ]
+    client = _gemini_client()
+    models = [GEMINI_MODEL] + ([GEMINI_FALLBACK] if GEMINI_FALLBACK and GEMINI_FALLBACK != GEMINI_MODEL else [])
+    first_error = None
+    for model in models:
+        # Least thinking first: it is the biggest speed-up. Fall back if the model rejects it.
+        for thinking in ("minimal", "low", None):
+            try:
+                return _gemini_call(client, model, contents, thinking)
+            except Exception as e:
+                first_error = first_error or e
+                if thinking is not None and _is_config_error(e):
+                    continue  # try the next, gentler setting on the same model
+                break  # slow, busy or broken: try the faster fallback model
+    raise first_error
 
 
 def run_claude(policy, ad):
@@ -151,7 +253,7 @@ def run_claude(policy, ad):
         kind = "document" if item[2] == "application/pdf" else "image"
         return {"type": kind, "source": {"type": "base64", "media_type": item[2], "data": data}}
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(timeout=60.0, max_retries=1)
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=2000,
@@ -201,14 +303,18 @@ def check():
         policy_file = request.files.get("policy")
         policy_text = (request.form.get("policy_text") or "").strip()
         if policy_file and policy_file.filename:
-            policy = read_upload(policy_file)
+            policy = read_upload(policy_file, policy=True)
         elif policy_text:
             policy = ("text", policy_text)
         else:
             raise UserError("Add the company rules first, as a file or as pasted text.")
 
         ad = read_upload(ad_file)
-        return jsonify(run_check(policy, ad))
+        started = time.time()
+        result = run_check(policy, ad)
+        result["seconds"] = round(time.time() - started, 1)
+        print(f"[check] {provider()} answered in {result['seconds']}s", flush=True)
+        return jsonify(result)
     except UserError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:  # provider/network errors
@@ -408,9 +514,84 @@ aside{position:sticky;top:20px}
 .contact small{display:block;color:var(--muted)}
 footer{border-top:1px solid var(--line);padding:22px 0 40px;color:var(--muted);font-size:15px}
 footer a{color:var(--ink)}
+
+/* ===== visual upgrade ===== */
+body{position:relative;overflow-x:hidden;background:#EDEFFB}
+.wrap{position:relative;z-index:1}
+.bg{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
+.bg .orb{position:absolute;border-radius:50%;filter:blur(72px);opacity:.5;animation:orb 22s ease-in-out infinite alternate}
+.o1{width:560px;height:560px;left:-140px;top:-130px;background:#7C6CFF}
+.o2{width:480px;height:480px;right:-130px;top:28%;background:#FFC247;animation-duration:27s}
+.o3{width:540px;height:540px;left:28%;bottom:-240px;background:#5EE0B5;animation-duration:31s;opacity:.4}
+@keyframes orb{to{transform:translate(70px,50px) scale(1.12)}}
+.gridlines{position:absolute;inset:0;background-image:linear-gradient(rgba(74,63,224,.08) 1px,transparent 1px),linear-gradient(90deg,rgba(74,63,224,.08) 1px,transparent 1px);background-size:56px 56px;-webkit-mask-image:radial-gradient(ellipse at 50% 28%,#000 15%,transparent 78%);mask-image:radial-gradient(ellipse at 50% 28%,#000 15%,transparent 78%)}
+#net{position:absolute;inset:0;width:100%;height:100%}
+#floaters{position:absolute;inset:0}
+.fl{position:absolute;animation:drift var(--d,16s) ease-in-out infinite alternate}
+.fl svg{display:block;width:100%;height:auto;filter:drop-shadow(0 10px 14px rgba(17,26,54,.18))}
+@keyframes drift{from{transform:translate(0,0) rotate(var(--r0,0deg))}to{transform:translate(var(--dx,30px),var(--dy,-40px)) rotate(var(--r1,10deg))}}
+#fx{position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:60}
+
+/* header + glass */
+.brand{font-size:26px;gap:12px}
+body[data-tab="check"] #appname{display:none}
+.brand svg{width:46px;height:46px}
+.tabs,.panel,.sheet,.steps li,.contact{background:rgba(255,255,255,.88);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.lede{color:#3B4668}
+
+/* giant wordmark */
+.titlebar{padding:8px 0 0}
+h1.wordmark{font:800 clamp(40px,6.4vw,74px)/1.02 var(--display);letter-spacing:-.025em;max-width:none;margin:0;text-shadow:0 12px 44px rgba(74,63,224,.3)}
+@media (max-width:760px){h1.wordmark{font-size:clamp(30px,9vw,64px)}}
+.wordmark .wd{display:inline-block;white-space:nowrap}
+.wordmark .ch{display:inline-block;animation:drop .7s cubic-bezier(.2,.9,.3,1.25) backwards,wave .9s ease 1.4s 1;animation-delay:calc(var(--i)*45ms),calc(1.4s + var(--i)*55ms);transition:transform .2s,color .2s;cursor:default}
+.wordmark .ch:hover{transform:translateY(-10px) rotate(-5deg);color:var(--brand)}
+.wordmark .hy{color:var(--brand)}
+@keyframes drop{from{transform:translateY(-70%) rotate(-10deg);opacity:0}to{transform:none;opacity:1}}
+@keyframes wave{0%,100%{color:var(--ink)}50%{color:var(--brand)}}
+.uline{height:9px;width:min(280px,46%);margin-top:10px;border-radius:99px;background:linear-gradient(90deg,var(--brand),var(--amber));transform-origin:left;animation:draw .8s ease 1.7s backwards}
+@keyframes draw{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+
+/* hero */
+.hero{padding:22px 0 30px}
+.tagline{font:800 clamp(24px,3.6vw,40px)/1.1 var(--display);letter-spacing:-.01em;max-width:18ch}
+.feats{list-style:none;margin:24px 0 0;padding:0;display:grid;gap:10px;max-width:440px}
+.feat{display:flex;align-items:center;gap:12px;background:rgba(255,255,255,.86);border:1px solid var(--line);border-radius:14px;padding:10px 14px;font-weight:600;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.fi{display:grid;place-items:center;width:38px;height:38px;border-radius:50%;background:var(--brand-soft);color:var(--brand);flex:none}
+.fi.amber{background:#FFF0CC;color:#9A6A00}.fi.green{background:var(--pass-soft);color:var(--pass)}
+.fi .ic svg{width:21px;height:21px}
+.hero-art{max-width:460px;background:rgba(233,231,253,.85);box-shadow:var(--shadow)}
+@keyframes scan{from{transform:translateX(0)}to{transform:translateX(340px)}}
+.lens{animation:lens 8s ease-in-out infinite alternate}
+@keyframes lens{from{transform:translate(-56px,-26px)}to{transform:translate(52px,62px)}}
+.spark{transform-box:fill-box;transform-origin:center;animation:tw 2.6s ease-in-out infinite}
+.sp2{animation-delay:-.9s}.sp3{animation-delay:-1.7s}
+@keyframes tw{50%{transform:scale(.35);opacity:.35}}
+
+/* panels */
+.panel h2{display:flex;align-items:center;gap:10px}
+.hico{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:var(--brand-soft);color:var(--brand);flex:none}
+.hico.amber{background:#FFF0CC;color:#9A6A00}
+.hico .ic svg{width:22px;height:22px}
+.btn.block{box-shadow:0 14px 30px -12px rgba(74,63,224,.7)}
+.btn.block:disabled{box-shadow:none}
+.sheet.fail{animation:shake .45s}
+.sheet.pass{animation:glow 1.2s ease-out}
+@keyframes shake{20%{transform:translateX(-6px)}40%{transform:translateX(6px)}60%{transform:translateX(-4px)}80%{transform:translateX(3px)}}
+@keyframes glow{from{box-shadow:0 0 0 0 rgba(18,128,95,.5)}to{box-shadow:0 0 0 26px rgba(18,128,95,0)}}
+@media (prefers-reduced-motion:reduce){
+  .bg .orb,.fl,.lens,.spark,.wordmark .ch,.uline,.sheet.fail,.sheet.pass{animation:none}
+}
 </style>
 </head>
 <body>
+<div class="bg" aria-hidden="true">
+  <div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div>
+  <div class="gridlines"></div>
+  <canvas id="net"></canvas>
+  <div id="floaters"></div>
+</div>
+<canvas id="fx" aria-hidden="true"></canvas>
 <div class="wrap">
   <header class="top">
     <a class="brand" href="#check" aria-label="brand-governance home">
@@ -427,33 +608,50 @@ footer a{color:var(--ink)}
   <main>
   <!-- CHECK -->
   <section id="panel-check" role="tabpanel" aria-labelledby="tab-check">
+    <div class="titlebar">
+      <h1 class="wordmark" id="wordmark">brand-governance</h1>
+      <div class="uline" aria-hidden="true"></div>
+    </div>
     <div class="hero">
       <div>
-        <h1>Does your ad follow the rules?</h1>
+        <h2 class="tagline">Does your ad follow the rules?</h2>
         <p class="lede">Add your company's rules and your ad. You get a pass, or clear steps to fix what breaks.</p>
+        <ul class="feats">
+          <li class="feat"><span class="fi"><span class="ic" data-icon="eye" aria-hidden="true"></span></span>Reads PDFs and images</li>
+          <li class="feat"><span class="fi amber"><span class="ic" data-icon="edit" aria-hidden="true"></span></span>Fix steps for every broken rule</li>
+          <li class="feat"><span class="fi green"><span class="ic" data-icon="person" aria-hidden="true"></span></span>Human sign-off when it passes</li>
+        </ul>
       </div>
       <div class="hero-art">
-        <svg viewBox="0 0 360 290" role="img" aria-label="An ad being scanned, with a green check for what passes and a red flag for what breaks">
+        <svg viewBox="0 0 400 330" role="img" aria-label="An ad being scanned by a magnifying lens, with a green check for what passes and a red flag for what breaks">
           <defs>
-            <clipPath id="adclip"><rect x="30" y="24" width="228" height="232" rx="16"/></clipPath>
+            <clipPath id="adclip"><rect x="40" y="34" width="240" height="250" rx="18"/></clipPath>
             <linearGradient id="scanG" x1="0" x2="1"><stop offset="0" stop-color="#4A3FE0" stop-opacity="0"/><stop offset="1" stop-color="#4A3FE0" stop-opacity=".3"/></linearGradient>
           </defs>
-          <rect x="44" y="40" width="228" height="232" rx="16" fill="#C9C3F7"/>
-          <rect x="30" y="24" width="228" height="232" rx="16" fill="#fff" stroke="#DCE0EE"/>
+          <rect x="58" y="54" width="240" height="250" rx="18" fill="#C9C3F7"/>
+          <rect x="40" y="34" width="240" height="250" rx="18" fill="#fff" stroke="#DCE0EE"/>
           <g clip-path="url(#adclip)">
-            <rect x="30" y="24" width="228" height="108" fill="#111A36"/>
-            <circle cx="206" cy="74" r="32" fill="#4A3FE0"/>
-            <circle cx="228" cy="98" r="19" fill="#FFC247"/>
-            <rect x="50" y="52" width="96" height="11" rx="5.5" fill="#fff"/>
-            <rect x="50" y="72" width="66" height="11" rx="5.5" fill="#fff" opacity=".55"/>
-            <rect x="50" y="152" width="156" height="9" rx="4.5" fill="#C9CEE0"/>
-            <rect x="50" y="172" width="124" height="9" rx="4.5" fill="#DCE0EE"/>
-            <rect x="50" y="194" width="92" height="9" rx="4.5" fill="#DCE0EE"/>
-            <rect x="50" y="220" width="78" height="26" rx="13" fill="#4A3FE0"/>
-            <g class="scan"><rect x="-44" y="24" width="44" height="232" fill="url(#scanG)"/><rect x="-2" y="24" width="2.5" height="232" fill="#4A3FE0"/></g>
+            <rect x="40" y="34" width="240" height="116" fill="#111A36"/>
+            <circle cx="228" cy="88" r="34" fill="#4A3FE0"/>
+            <circle cx="252" cy="114" r="20" fill="#FFC247"/>
+            <rect x="62" y="62" width="104" height="12" rx="6" fill="#fff"/>
+            <rect x="62" y="84" width="72" height="12" rx="6" fill="#fff" opacity=".55"/>
+            <rect x="62" y="172" width="168" height="10" rx="5" fill="#C9CEE0"/>
+            <rect x="62" y="192" width="136" height="10" rx="5" fill="#DCE0EE"/>
+            <rect x="62" y="212" width="100" height="10" rx="5" fill="#DCE0EE"/>
+            <rect x="62" y="240" width="84" height="28" rx="14" fill="#4A3FE0"/>
+            <g class="scan"><rect x="-48" y="34" width="48" height="250" fill="url(#scanG)"/><rect x="-2" y="34" width="2.5" height="250" fill="#4A3FE0"/></g>
           </g>
-          <g class="badge b1"><circle cx="280" cy="78" r="26" fill="#12805F" stroke="#E9E7FD" stroke-width="5"/><path d="M269 78.5l7.5 7.5L291 70" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/></g>
-          <g class="badge b2"><circle cx="280" cy="186" r="26" fill="#C7372B" stroke="#E9E7FD" stroke-width="5"/><path d="M280 173v15" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/><circle cx="280" cy="197" r="2.8" fill="#fff"/></g>
+          <g class="lens">
+            <circle cx="150" cy="150" r="46" fill="rgba(255,255,255,.3)" stroke="#4A3FE0" stroke-width="7"/>
+            <path d="M183 183l32 32" stroke="#4A3FE0" stroke-width="11" stroke-linecap="round"/>
+            <path d="M133 152l12 12 24-26" fill="none" stroke="#FFC247" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+          </g>
+          <g class="badge b1"><circle cx="312" cy="96" r="28" fill="#12805F" stroke="#E9E7FD" stroke-width="5"/><path d="M300 96.5l8 8L324 87" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></g>
+          <g class="badge b2"><circle cx="312" cy="214" r="28" fill="#C7372B" stroke="#E9E7FD" stroke-width="5"/><path d="M312 200v16" stroke="#fff" stroke-width="5" stroke-linecap="round"/><circle cx="312" cy="226" r="3.2" fill="#fff"/></g>
+          <g transform="translate(352 40)"><path class="spark" d="M0-13L3.5-3.5 13 0 3.5 3.5 0 13-3.5 3.5-13 0-3.5-3.5Z" fill="#FFC247"/></g>
+          <g transform="translate(24 300)"><path class="spark sp2" d="M0-11L3-3 11 0 3 3 0 11-3 3-11 0-3-3Z" fill="#4A3FE0"/></g>
+          <g transform="translate(360 292)"><path class="spark sp3" d="M0-9L2.5-2.5 9 0 2.5 2.5 0 9-2.5 2.5-9 0-2.5-2.5Z" fill="#12805F"/></g>
         </svg>
       </div>
     </div>
@@ -463,7 +661,7 @@ footer a{color:var(--ink)}
     <div class="tool">
       <div class="stack">
         <section class="panel">
-          <h2>Company rules</h2>
+          <h2><span class="hico"><span class="ic" data-icon="shield" aria-hidden="true"></span></span>Company rules</h2>
           <p class="hint">The policy your ad has to follow.</p>
           <label class="drop" id="policyDrop">
             <input class="vh" type="file" id="policyFile" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.txt,.md">
@@ -477,7 +675,7 @@ footer a{color:var(--ink)}
         </section>
 
         <section class="panel">
-          <h2>Advertisement</h2>
+          <h2><span class="hico amber"><span class="ic" data-icon="image" aria-hidden="true"></span></span>Advertisement</h2>
           <p class="hint">The ad you want checked.</p>
           <label class="drop" id="adDrop">
             <input class="vh" type="file" id="adFile" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp">
@@ -543,8 +741,8 @@ footer a{color:var(--ink)}
               <g id="innerLetters"></g>
             </g>
             <circle cx="160" cy="160" r="52" fill="#FFC247"/>
-            <text x="160" y="154" text-anchor="middle" font-size="12" fill="#111A36" style="font-weight:800">THE</text>
-            <text x="160" y="171" text-anchor="middle" font-size="12" fill="#111A36" style="font-weight:800">CIPHERERS</text>
+            <text x="160" y="154" text-anchor="middle" font-size="8.5" fill="#111A36" style="font-weight:800">THE</text>
+            <text x="160" y="167" text-anchor="middle" font-size="8.5" fill="#111A36" style="font-weight:800">CIPHERERS</text>
             <path d="M151 4h18l-9 18z" fill="#FFC247"/>
           </svg>
         </button>
@@ -615,6 +813,7 @@ footer a{color:var(--ink)}
       $("tab-"+t).tabIndex=on?0:-1;
       $("panel-"+t).hidden=!on;
     });
+    document.body.setAttribute("data-tab",name);
   }
   TABS.forEach(function(t,i){
     var b=$("tab-"+t);
@@ -717,6 +916,8 @@ footer a{color:var(--ink)}
     if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(ok,fallback); } else fallback();
   }
 
+  function took(d){ return d.seconds?h("p",{class:"fine",text:"Checked in "+d.seconds+" seconds."}):null; }
+
   function renderFail(d){
     sheet.className="sheet fail";
     var box=h("div"), n=d.violations.length;
@@ -738,6 +939,7 @@ footer a{color:var(--ink)}
     var again=h("button",{class:"btn",type:"button"},[icon("upload"),"Upload the fixed ad"]);
     again.addEventListener("click",function(){ $("adFile").click(); });
     box.appendChild(h("div",{class:"actions"},[again,copyBtn]));
+    var t1=took(d); if(t1) box.appendChild(t1);
     show(box);
   }
 
@@ -759,7 +961,9 @@ footer a{color:var(--ink)}
       h("div",{class:"row"},[icon("person"),h("div",{},[h("h4",{text:"Get it verified by a person",style:"font:800 18px/1.2 var(--display);margin-bottom:4px"}),h("p",{text:"An AI can miss things. Open the checklist in a new tab so a person can confirm each point and sign off."})])]),
       link
     ]));
+    var t2=took(d); if(t2) box.appendChild(t2);
     show(box);
+    if(window.__confetti) window.__confetti();
   }
 
   go.addEventListener("click",function(){
@@ -768,16 +972,25 @@ footer a{color:var(--ink)}
     if(policyFile) fd.append("policy",policyFile); else fd.append("policy_text",$("policyText").value);
     go.disabled=true; go.textContent="Checking...";
     sheet.className="sheet"; stage.classList.add("scanning");
-    show(h("div",{class:"working"},[h("span",{class:"spin"}),h("p",{text:"Reading the ad against the rules. This takes a few seconds."})]));
+    var t0=Date.now(), msg=h("p",{text:"Reading the ad against the rules..."});
+    show(h("div",{class:"working"},[h("span",{class:"spin"}),msg]));
+    var timer=setInterval(function(){
+      var sec=Math.round((Date.now()-t0)/1000);
+      msg.textContent="Reading the ad against the rules... "+sec+"s"+(sec>25?" (taking longer than usual)":"");
+    },1000);
+    var ac=new AbortController(), killer=setTimeout(function(){ac.abort();},150000);
 
-    fetch("/api/check",{method:"POST",body:fd}).then(function(r){
+    fetch("/api/check",{method:"POST",body:fd,signal:ac.signal}).then(function(r){
       return r.json().then(function(j){return {ok:r.ok,body:j};});
     }).then(function(res){
       if(!res.ok){ show(h("p",{class:"err",text:res.body.error||"Something went wrong. Try again."})); return; }
       if(res.body.verdict==="PASS") renderPass(res.body); else renderFail(res.body);
-    }).catch(function(){
-      show(h("p",{class:"err",text:"Could not reach the app. Check that it is still running, then try again."}));
+    }).catch(function(e){
+      show(h("p",{class:"err",text:(e&&e.name==="AbortError")
+        ? "This is taking too long. Check your internet connection and try again."
+        : "Could not reach the app. Check that it is still running, then try again."}));
     }).then(function(){
+      clearInterval(timer); clearTimeout(killer);
       stage.classList.remove("scanning"); go.textContent="Check ad"; refresh();
       if(window.matchMedia("(max-width:860px)").matches){ sheet.scrollIntoView({block:"start"}); }
     });
@@ -806,6 +1019,135 @@ footer a{color:var(--ink)}
   spin();
   $("wheelbtn").addEventListener("click",function(){ shift=(shift+1)%26; if(shift===0) shift=26; spin(); });
   $("copyMail").addEventListener("click",function(){ copy("thecipherers@gmail.com",$("copyMail"),"Copied"); });
+})();
+</script>
+<script>
+(function(){
+  "use strict";
+  var reduce=window.matchMedia("(prefers-reduced-motion:reduce)").matches;
+
+  /* icons for the new graphics */
+  var IC={
+    shield:'<path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/>',
+    image:'<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 9"/>',
+    eye:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    edit:'<path d="M4 20h4L19 9a2.8 2.8 0 00-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
+    person:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0113 0"/><path d="M16 11.5l2 2 3.5-4"/>'
+  };
+  Array.prototype.forEach.call(document.querySelectorAll("[data-icon]"),function(el){
+    var p=IC[el.getAttribute("data-icon")]; if(p) el.innerHTML='<svg viewBox="0 0 24 24">'+p+'</svg>';
+  });
+
+  /* giant wordmark, one letter at a time */
+  var wm=document.getElementById("wordmark");
+  if(wm){
+    var label=wm.textContent; wm.setAttribute("aria-label",label); wm.textContent="";
+    var idx=0;
+    ["brand-","governance"].forEach(function(part){
+      var w=document.createElement("span"); w.className="wd"; w.setAttribute("aria-hidden","true");
+      part.split("").forEach(function(c){
+        var s=document.createElement("span"); s.className="ch"+(c==="-"?" hy":"");
+        s.style.setProperty("--i",idx++); s.textContent=c; w.appendChild(s);
+      });
+      wm.appendChild(w);
+    });
+  }
+
+  /* floating shapes */
+  var T={
+    card:'<svg viewBox="0 0 64 64"><rect x="8" y="6" width="48" height="52" rx="8" fill="#fff" stroke="#C9C3F7" stroke-width="2"/><rect x="14" y="12" width="36" height="18" rx="4" fill="#111A36"/><rect x="14" y="36" width="26" height="4" rx="2" fill="#C9CEE0"/><rect x="14" y="44" width="18" height="4" rx="2" fill="#DCE0EE"/></svg>',
+    ok:'<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="26" fill="#12805F"/><path d="M20 33l8 8 16-17" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    no:'<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="26" fill="#C7372B"/><path d="M32 18v18" stroke="#fff" stroke-width="6" stroke-linecap="round"/><circle cx="32" cy="46" r="3.6" fill="#fff"/></svg>',
+    lens:'<svg viewBox="0 0 64 64"><circle cx="27" cy="27" r="17" fill="rgba(255,255,255,.55)" stroke="#4A3FE0" stroke-width="5"/><path d="M40 40l16 16" stroke="#4A3FE0" stroke-width="7" stroke-linecap="round"/></svg>',
+    shield:'<svg viewBox="0 0 64 64"><path d="M32 5l21 8v15c0 15-9 25-21 31C20 53 11 43 11 28V13z" fill="#4A3FE0"/><path d="M22 31l7 7 13-15" fill="none" stroke="#FFC247" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    star:'<svg viewBox="0 0 64 64"><path d="M32 4l7 21 21 7-21 7-7 21-7-21-21-7 21-7z" fill="#FFC247"/></svg>'
+  };
+  var kinds=["card","ok","lens","shield","no","star","card","ok","star","lens","shield","card","no","star"];
+  var box=document.getElementById("floaters");
+  var count=window.innerWidth<700?7:kinds.length;
+  function rnd(a,b){return a+Math.random()*(b-a);}
+  var small=window.innerWidth<700;
+  for(var i=0;i<count;i++){
+    var d=document.createElement("div"); d.className="fl";
+    var px=small?rnd(26,44):rnd(40,86);
+    var edge=!small && i%5!==4;
+    var left=edge?(i%2?rnd(91,98):rnd(0,5)):rnd(0,94);
+    d.style.width=px+"px"; d.style.left=left+"%"; d.style.top=rnd(0,92)+"%";
+    d.style.opacity=edge?rnd(.65,.9):rnd(.28,.4);
+    d.style.setProperty("--d",rnd(13,28)+"s");
+    d.style.setProperty("--dx",rnd(-50,50)+"px"); d.style.setProperty("--dy",rnd(-60,60)+"px");
+    d.style.setProperty("--r0",rnd(-18,18)+"deg"); d.style.setProperty("--r1",rnd(-30,30)+"deg");
+    d.style.animationDelay="-"+rnd(0,12)+"s";
+    d.innerHTML=T[kinds[i]]; box.appendChild(d);
+  }
+
+  /* particle network that reacts to the cursor */
+  var cv=document.getElementById("net"), ctx=cv.getContext("2d");
+  var W=0,H=0,dpr=Math.min(window.devicePixelRatio||1,2),pts=[],mouse={x:-9999,y:-9999};
+  function size(){
+    W=window.innerWidth; H=window.innerHeight;
+    cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+    var n=Math.round(Math.min(80,W*H/16000)); pts=[];
+    for(var k=0;k<n;k++) pts.push({x:Math.random()*W,y:Math.random()*H,vx:rnd(-.35,.35),vy:rnd(-.35,.35),r:rnd(1.4,3)});
+  }
+  function frame(){
+    ctx.clearRect(0,0,W,H);
+    var j,k,p,q,dx,dy,dist;
+    for(j=0;j<pts.length;j++){
+      p=pts[j];
+      if(!reduce){
+        dx=mouse.x-p.x; dy=mouse.y-p.y; dist=Math.sqrt(dx*dx+dy*dy);
+        if(dist<170&&dist>1){ p.vx+=dx/dist*.012; p.vy+=dy/dist*.012; }
+        p.vx*=.995; p.vy*=.995;
+        var sp=Math.sqrt(p.vx*p.vx+p.vy*p.vy); if(sp>.9){p.vx*=.9/sp;p.vy*=.9/sp;}
+        if(sp<.12){p.vx+=rnd(-.02,.02);p.vy+=rnd(-.02,.02);}
+        p.x+=p.vx; p.y+=p.vy;
+        if(p.x<-10)p.x=W+10; if(p.x>W+10)p.x=-10; if(p.y<-10)p.y=H+10; if(p.y>H+10)p.y=-10;
+      }
+    }
+    for(j=0;j<pts.length;j++){
+      p=pts[j];
+      for(k=j+1;k<pts.length;k++){
+        q=pts[k]; dx=p.x-q.x; dy=p.y-q.y; dist=Math.sqrt(dx*dx+dy*dy);
+        if(dist<130){ ctx.strokeStyle="rgba(74,63,224,"+(0.24*(1-dist/130))+")"; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(q.x,q.y); ctx.stroke(); }
+      }
+      dx=p.x-mouse.x; dy=p.y-mouse.y; dist=Math.sqrt(dx*dx+dy*dy);
+      if(dist<190){ ctx.strokeStyle="rgba(255,160,0,"+(0.6*(1-dist/190))+")"; ctx.lineWidth=1.4; ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(mouse.x,mouse.y); ctx.stroke(); }
+      ctx.fillStyle="rgba(74,63,224,.55)"; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,6.2832); ctx.fill();
+    }
+    if(!reduce) requestAnimationFrame(frame);
+  }
+  size(); frame();
+  var rt; window.addEventListener("resize",function(){ clearTimeout(rt); rt=setTimeout(function(){ size(); if(reduce) frame(); },150); });
+  window.addEventListener("pointermove",function(e){ mouse.x=e.clientX; mouse.y=e.clientY; });
+  window.addEventListener("pointerleave",function(){ mouse.x=mouse.y=-9999; });
+
+  /* confetti when an ad passes */
+  var fx=document.getElementById("fx");
+  window.__confetti=function(){
+    if(reduce) return;
+    var c=fx.getContext("2d"); fx.width=window.innerWidth; fx.height=window.innerHeight;
+    var sh=document.getElementById("sheet").getBoundingClientRect();
+    var ox=Math.max(40,Math.min(sh.left+sh.width/2,window.innerWidth-40));
+    var oy=Math.max(90,Math.min(sh.top+130,window.innerHeight*.6));
+    var colors=["#4A3FE0","#FFC247","#12805F","#FF6B8A","#5EE0B5","#7C6CFF"], bits=[];
+    for(var n=0;n<120;n++){
+      var a=-Math.PI/2+rnd(-1.15,1.15), v=rnd(6,14);
+      bits.push({x:ox,y:oy,vx:Math.cos(a)*v,vy:Math.sin(a)*v,w:rnd(6,12),h:rnd(4,8),r:rnd(0,6.28),vr:rnd(-.3,.3),c:colors[n%colors.length]});
+    }
+    var start=null;
+    function tick(t){
+      if(start===null) start=t;
+      var el=t-start; c.clearRect(0,0,fx.width,fx.height);
+      if(el>2600){ return; }
+      bits.forEach(function(b){
+        b.vy+=.3; b.vx*=.992; b.x+=b.vx; b.y+=b.vy; b.r+=b.vr;
+        c.save(); c.globalAlpha=Math.max(0,1-el/2600); c.translate(b.x,b.y); c.rotate(b.r); c.fillStyle=b.c; c.fillRect(-b.w/2,-b.h/2,b.w,b.h); c.restore();
+      });
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  };
 })();
 </script>
 </body>
