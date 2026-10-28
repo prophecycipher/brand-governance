@@ -33,6 +33,16 @@ GEMINI_FALLBACK = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-lat
 GEMINI_TIMEOUT_MS = int(float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "45")) * 1000)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 
+# Languages the verdict (and the corrected ad) can be written in.
+LANGUAGES = {
+    "en": "English",
+    "hi": "Hindi (Devanagari script)",
+    "zh": "Simplified Chinese",
+    "ja": "Japanese",
+    "de": "German",
+    "ru": "Russian",
+}
+
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 TEXT_TYPES = {".txt", ".md"}
 
@@ -62,6 +72,40 @@ Respond with ONLY valid JSON in this exact shape:
  "checked": ["<short rule name>", "..."],
  "violations": [{"rule": "...", "reason": "...", "fix": "..."}]}
 For PASS, "violations" must be an empty list."""
+
+FIX_PROMPT = """You are an advertisement copywriter and compliance editor.
+
+You are given (1) a company's rules and policies, (2) an advertisement that
+FAILED the policy check, and (3) the list of violations found.
+Your job: produce a corrected version of the ad that follows EVERY rule while
+keeping the original message, offer, tone and purpose as close as possible.
+
+Rules:
+- Use ONLY the policy provided. Do not invent rules or facts.
+- Do not invent prices, dates, statistics or claims that are not in the
+  original ad. If a required element needs information you do not have
+  (for example a legal disclaimer's exact text), use a clear placeholder in
+  square brackets such as [add legal disclaimer here].
+- Remove or reword every violating claim; add every missing required element.
+- "design_changes" lists non-text changes a designer must make (logo, colors,
+  layout, image changes). Use an empty list if there are none.
+- "changes" lists, in one short line each, what you changed and which
+  violation it resolves.
+
+Respond with ONLY valid JSON in this exact shape:
+{"headline": "...", "body": "...", "call_to_action": "...", "fine_print": "...",
+ "design_changes": ["..."], "changes": ["..."]}
+Use an empty string for any text part the ad does not need."""
+
+
+def language_note(lang):
+    name = LANGUAGES.get(lang, "English")
+    if name == "English":
+        return ""
+    return (
+        f"\n\nLANGUAGE: Write all human-readable text in {name}. "
+        "Keep the JSON keys and the verdict value (PASS or FAIL) exactly as specified, in English."
+    )
 
 
 # ----------------------------------------------------------------- helpers
@@ -193,10 +237,10 @@ def _gemini_client():
     return genai.Client(api_key=key, http_options=opts) if opts else genai.Client(api_key=key)
 
 
-def _gemini_call(client, model, contents, thinking):
+def _gemini_call(client, model, contents, thinking, system):
     from google.genai import types
 
-    cfg = {"system_instruction": SYSTEM_PROMPT, "response_mime_type": "application/json"}
+    cfg = {"system_instruction": system, "response_mime_type": "application/json"}
     if thinking:
         cfg["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
     response = client.models.generate_content(
@@ -212,7 +256,7 @@ def _is_config_error(e):
     return e.__class__.__name__ in ("ValidationError", "TypeError") or "thinking" in str(e).lower()
 
 
-def run_gemini(policy, ad):
+def run_gemini(policy, ad, system=SYSTEM_PROMPT, closing=None):
     from google.genai import types
 
     def part(item):
@@ -225,7 +269,7 @@ def run_gemini(policy, ad):
         part(policy),
         "ADVERTISEMENT TO REVIEW:",
         part(ad),
-        "Does the advertisement follow the policy? Reply with the JSON only.",
+        closing or "Does the advertisement follow the policy? Reply with the JSON only.",
     ]
     client = _gemini_client()
     models = [GEMINI_MODEL] + ([GEMINI_FALLBACK] if GEMINI_FALLBACK and GEMINI_FALLBACK != GEMINI_MODEL else [])
@@ -234,7 +278,7 @@ def run_gemini(policy, ad):
         # Least thinking first: it is the biggest speed-up. Fall back if the model rejects it.
         for thinking in ("minimal", "low", None):
             try:
-                return _gemini_call(client, model, contents, thinking)
+                return _gemini_call(client, model, contents, thinking, system)
             except Exception as e:
                 first_error = first_error or e
                 if thinking is not None and _is_config_error(e):
@@ -243,7 +287,7 @@ def run_gemini(policy, ad):
     raise first_error
 
 
-def run_claude(policy, ad):
+def run_claude(policy, ad, system=SYSTEM_PROMPT, closing=None):
     import anthropic
 
     def block(item):
@@ -257,7 +301,7 @@ def run_claude(policy, ad):
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=2000,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=[{
             "role": "user",
             "content": [
@@ -265,23 +309,84 @@ def run_claude(policy, ad):
                 block(policy),
                 {"type": "text", "text": "ADVERTISEMENT TO REVIEW:"},
                 block(ad),
-                {"type": "text", "text": "Does the advertisement follow the policy? Reply with the JSON only."},
+                {"type": "text", "text": closing or "Does the advertisement follow the policy? Reply with the JSON only."},
             ],
         }],
     )
     return "".join(b.text for b in response.content if b.type == "text")
 
 
-def run_check(policy, ad):
+NO_KEY = (
+    "No API key is set. Set GEMINI_API_KEY (free at aistudio.google.com) "
+    "or ANTHROPIC_API_KEY, then restart the app."
+)
+
+
+def run_check(policy, ad, lang="en"):
     which = provider()
+    system = SYSTEM_PROMPT + language_note(lang)
     if which == "gemini":
-        return parse_result(run_gemini(policy, ad))
+        return parse_result(run_gemini(policy, ad, system=system))
     if which == "claude":
-        return parse_result(run_claude(policy, ad))
-    raise UserError(
-        "No API key is set. Set GEMINI_API_KEY (free at aistudio.google.com) "
-        "or ANTHROPIC_API_KEY, then restart the app."
+        return parse_result(run_claude(policy, ad, system=system))
+    raise UserError(NO_KEY)
+
+
+def parse_fix(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        r = json.loads(text)
+    except json.JSONDecodeError:
+        raise UserError("The AI returned an answer in an unexpected format. Try again.")
+    if not isinstance(r, dict):
+        raise UserError("The AI returned an answer in an unexpected format. Try again.")
+
+    def s(key):
+        return str(r.get(key) or "").strip()
+
+    def lst(key):
+        return [str(x).strip() for x in (r.get(key) or []) if str(x).strip()]
+
+    return {
+        "headline": s("headline"),
+        "body": s("body"),
+        "call_to_action": s("call_to_action"),
+        "fine_print": s("fine_print"),
+        "design_changes": lst("design_changes"),
+        "changes": lst("changes"),
+    }
+
+
+def run_fix(policy, ad, violations, lang="en"):
+    which = provider()
+    system = FIX_PROMPT + language_note(lang)
+    closing = (
+        "VIOLATIONS FOUND IN THE AD:\n"
+        + json.dumps(violations, ensure_ascii=False, indent=2)
+        + "\n\nWrite the corrected version of the ad. Reply with the JSON only."
     )
+    if which == "gemini":
+        return parse_fix(run_gemini(policy, ad, system=system, closing=closing))
+    if which == "claude":
+        return parse_fix(run_claude(policy, ad, system=system, closing=closing))
+    raise UserError(NO_KEY)
+
+
+def read_policy_from_request():
+    policy_file = request.files.get("policy")
+    policy_text = (request.form.get("policy_text") or "").strip()
+    if policy_file and policy_file.filename:
+        return read_upload(policy_file, policy=True)
+    if policy_text:
+        return ("text", policy_text)
+    raise UserError("Add the company rules first, as a file or as pasted text.")
+
+
+def lang_from_request():
+    lang = (request.form.get("lang") or "en").strip()
+    return lang if lang in LANGUAGES else "en"
 
 
 # ------------------------------------------------------------------ routes
@@ -290,7 +395,7 @@ def status():
     which = provider()
     name = "brand-governance"
     by = {"gemini": "Google Gemini", "claude": "Claude"}.get(which, "AI")
-    return jsonify({"provider": which, "name": name, "by": by})
+    return jsonify({"provider": which, "name": name, "by": by, "languages": LANGUAGES})
 
 
 @app.post("/api/check")
@@ -300,18 +405,10 @@ def check():
         if not ad_file or not ad_file.filename:
             raise UserError("Add the advertisement first.")
 
-        policy_file = request.files.get("policy")
-        policy_text = (request.form.get("policy_text") or "").strip()
-        if policy_file and policy_file.filename:
-            policy = read_upload(policy_file, policy=True)
-        elif policy_text:
-            policy = ("text", policy_text)
-        else:
-            raise UserError("Add the company rules first, as a file or as pasted text.")
-
+        policy = read_policy_from_request()
         ad = read_upload(ad_file)
         started = time.time()
-        result = run_check(policy, ad)
+        result = run_check(policy, ad, lang_from_request())
         result["seconds"] = round(time.time() - started, 1)
         print(f"[check] {provider()} answered in {result['seconds']}s", flush=True)
         return jsonify(result)
@@ -319,6 +416,32 @@ def check():
         return jsonify({"error": str(e)}), 400
     except Exception as e:  # provider/network errors
         return jsonify({"error": f"The check could not be completed: {str(e)[:300]}"}), 502
+
+
+@app.post("/api/fix")
+def fix():
+    """Generate a corrected version of a failed ad."""
+    try:
+        ad_file = request.files.get("ad")
+        if not ad_file or not ad_file.filename:
+            raise UserError("Add the advertisement first.")
+        try:
+            violations = json.loads(request.form.get("violations") or "[]")
+        except json.JSONDecodeError:
+            violations = []
+        if not isinstance(violations, list) or not violations:
+            raise UserError("There are no violations to fix. Run a check first.")
+        policy = read_policy_from_request()
+        ad = read_upload(ad_file)
+        started = time.time()
+        result = run_fix(policy, ad, violations, lang_from_request())
+        result["seconds"] = round(time.time() - started, 1)
+        print(f"[fix] {provider()} answered in {result['seconds']}s", flush=True)
+        return jsonify(result)
+    except UserError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"The corrected ad could not be generated: {str(e)[:300]}"}), 502
 
 
 @app.errorhandler(413)
@@ -347,14 +470,14 @@ PAGE = r"""<!doctype html>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%234A3FE0'/%3E%3Ccircle cx='15' cy='15' r='7' fill='none' stroke='white' stroke-width='2.5'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Syne:wght@600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
 <style>
 :root{
   --bg:#F4F5FB; --surface:#FFFFFF; --ink:#111A36; --muted:#5A6482; --line:#DCE0EE;
   --brand:#4A3FE0; --brand-ink:#3B31C4; --brand-soft:#E9E7FD; --amber:#FFC247;
   --pass:#12805F; --pass-soft:#DFF4EC; --fail:#C7372B; --fail-soft:#FCE6E3; --focus:#1F6FEB;
-  --display:"Syne",system-ui,sans-serif;
-  --body:"Instrument Sans",system-ui,sans-serif;
+  --display:"Plus Jakarta Sans","Instrument Sans",system-ui,"Noto Sans Devanagari","Noto Sans SC","Noto Sans JP","Yu Gothic","Microsoft YaHei",sans-serif;
+  --body:"Instrument Sans",system-ui,"Noto Sans Devanagari","Noto Sans SC","Noto Sans JP","Yu Gothic","Microsoft YaHei",sans-serif;
   --shadow:0 1px 2px rgba(17,26,54,.06),0 14px 30px -18px rgba(74,63,224,.35);
 }
 *{box-sizing:border-box}
@@ -582,6 +705,42 @@ h1.wordmark{font:800 clamp(40px,6.4vw,74px)/1.02 var(--display);letter-spacing:-
 @media (prefers-reduced-motion:reduce){
   .bg .orb,.fl,.lens,.spark,.wordmark .ch,.uline,.sheet.fail,.sheet.pass{animation:none}
 }
+
+/* ===== bold, professional headings ===== */
+h1,h2,h3,h4{font-weight:800;color:var(--ink);text-wrap:balance}
+h1.wordmark{font-weight:800;letter-spacing:-.045em;line-height:1}
+.tagline{font-weight:800;letter-spacing:-.035em;line-height:1.08;max-width:20ch}
+.panel h2,.sheet>h2{font-size:22px;font-weight:800;letter-spacing:-.025em}
+.page h1{font-weight:800;letter-spacing:-.04em}
+.team{font-weight:800;letter-spacing:-.04em}
+.steps h3,.outcome h3,.know h2{font-weight:800;letter-spacing:-.02em}
+.vtitle{font-size:24px;font-weight:800;letter-spacing:-.025em}
+.vcard h4{font-weight:800;letter-spacing:-.01em}
+.stamp{font-weight:800;letter-spacing:.06em}
+.stamp.long{font-size:clamp(24px,4.6vw,38px);letter-spacing:.03em;padding:8px 18px}
+.panel h2::after,.sheet>h2::after{content:"";flex:1;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--line),transparent);margin-left:6px}
+
+/* language setting */
+.lang{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.88);border:1px solid var(--line);border-radius:999px;
+  padding:3px 6px 3px 14px;font-weight:600;font-size:14px;color:var(--muted);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.lang .ic{color:var(--brand)}
+.lang select{border:0;background:transparent;font:700 15px var(--body);color:var(--ink);padding:8px 6px;cursor:pointer;border-radius:999px}
+@media (max-width:600px){.lang{width:100%}.lang select{flex:1}}
+
+/* corrected ad */
+.btn.gen{background:linear-gradient(135deg,#4A3FE0,#8A5CF6);border-color:transparent;width:100%;margin-top:20px;box-shadow:0 14px 30px -14px rgba(74,63,224,.8)}
+.btn.gen:hover{filter:brightness(1.08)}
+.btn.gen:disabled{box-shadow:none}
+.fixout{margin-top:6px}
+.fixed{margin-top:18px;border:2px solid var(--brand);border-radius:16px;padding:18px;background:linear-gradient(180deg,#fff,var(--brand-soft))}
+.fixed-h{font:800 20px/1.2 var(--display);letter-spacing:-.02em;margin-bottom:12px}
+.adcard{background:#fff;border:1px solid var(--line);border-radius:14px;padding:18px;display:grid;gap:10px;box-shadow:var(--shadow)}
+.ad-h{font:800 22px/1.2 var(--display);letter-spacing:-.025em}
+.ad-b{color:#33405E;white-space:pre-wrap}
+.ad-cta{justify-self:start;background:var(--brand);color:#fff;font-weight:700;border-radius:999px;padding:8px 18px}
+.ad-fine{color:var(--muted);font-size:13px;white-space:pre-wrap}
+.fl-h{font:800 16px/1.2 var(--display);margin:16px 0 6px;letter-spacing:-.01em}
+.fixlist{margin:0;padding-left:20px;display:grid;gap:5px;color:#33405E}
 </style>
 </head>
 <body>
@@ -603,6 +762,18 @@ h1.wordmark{font:800 clamp(40px,6.4vw,74px)/1.02 var(--display);letter-spacing:-
       <button class="tab" role="tab" id="tab-how" aria-controls="panel-how" aria-selected="false" tabindex="-1">How it works</button>
       <button class="tab" role="tab" id="tab-about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About</button>
     </nav>
+    <label class="lang" for="lang">
+      <span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.7 4 5.7 4 9s-1.4 6.3-4 9c-2.6-2.7-4-5.7-4-9s1.4-6.3 4-9z"/></svg></span>
+      <span>Verdict language</span>
+      <select id="lang">
+        <option value="en">English</option>
+        <option value="hi">हिन्दी (Hindi)</option>
+        <option value="zh">中文 (Chinese)</option>
+        <option value="ja">日本語 (Japanese)</option>
+        <option value="de">Deutsch (German)</option>
+        <option value="ru">Русский (Russian)</option>
+      </select>
+    </label>
   </header>
 
   <main>
@@ -789,7 +960,9 @@ h1.wordmark{font:800 clamp(40px,6.4vw,74px)/1.02 var(--display);letter-spacing:-
     copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 012-2h9"/>',
     mail:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3.5 7l8.5 6.5L20.5 7"/>',
     person:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0113 0"/><path d="M16 11.5l2 2 3.5-4"/>',
-    upload:'<path d="M12 16V5M7.5 9.5L12 5l4.5 4.5"/><path d="M5 19h14"/>'
+    upload:'<path d="M12 16V5M7.5 9.5L12 5l4.5 4.5"/><path d="M5 19h14"/>',
+    sparkle:'<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 15l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/>',
+    download:'<path d="M12 4v11M7.5 10.5L12 15l4.5-4.5"/><path d="M5 19h14"/>'
   };
   function icon(name){
     var s=document.createElement("span"); s.className="ic"; s.setAttribute("aria-hidden","true");
@@ -892,16 +1065,47 @@ h1.wordmark{font:800 clamp(40px,6.4vw,74px)/1.02 var(--display);letter-spacing:-
   $("policyText").addEventListener("input",refresh);
 
   /* ---------- check ---------- */
+  /* ---------- verdict language ---------- */
+  var I18N={
+    en:{PASS:"PASS",FAIL:"FAIL",failOne:"Fix 1 thing, then check again",failMany:"Fix {n} things, then check again",failNone:"This ad breaks the company's rules",failSub:"Each card shows the rule, what is wrong in your ad, and how to fix it.",howFix:"How to fix: ",defFix:"Change the ad so it no longer breaks this rule, then check again.",copyFix:"Copy fix list",copied:"Copied",again:"Upload the fixed ad",passTitle:"This ad follows the company's rules",looked:"Rules the checker looked at:",humanH:"Get it verified by a person",humanP:"An AI can miss things. Open the checklist in a new tab so a person can confirm each point and sign off.",openList:"Open human review checklist",took:"Checked in {s} seconds.",reading:"Reading the ad against the rules...",slow:"(taking longer than usual)",checking:"Checking...",checkBtn:"Check ad",gen:"Generate corrected ad",genning:"Writing a corrected ad...",fixedH:"Corrected ad",headline:"Headline",body:"Body text",cta:"Call to action",fine:"Fine print",design:"Design changes needed",changes:"What was changed",copyAd:"Copy corrected ad",dl:"Download .txt",regen:"Generate again",aiNote:"Written by AI from your rules. A person should review it before it is used.",rerun:"The language was changed. Press Check ad again to get the verdict in this language.",problem:"Problem",fix:"Fix",adLabel:"Ad",resLabel:"Result"},
+    hi:{PASS:"पास",FAIL:"फेल",failOne:"1 बात ठीक करें, फिर दोबारा जाँचें",failMany:"{n} बातें ठीक करें, फिर दोबारा जाँचें",failNone:"यह विज्ञापन कंपनी के नियमों का उल्लंघन करता है",failSub:"हर कार्ड में नियम, आपके विज्ञापन में क्या गलत है और उसे कैसे ठीक करें, यह दिया गया है।",howFix:"ठीक कैसे करें: ",defFix:"विज्ञापन में ऐसा बदलाव करें कि वह इस नियम का उल्लंघन न करे, फिर दोबारा जाँचें।",copyFix:"सुधार सूची कॉपी करें",copied:"कॉपी हो गया",again:"सुधारा हुआ विज्ञापन अपलोड करें",passTitle:"यह विज्ञापन कंपनी के नियमों का पालन करता है",looked:"जाँचकर्ता ने ये नियम देखे:",humanH:"किसी व्यक्ति से सत्यापित करवाएँ",humanP:"AI से चूक हो सकती है। नए टैब में चेकलिस्ट खोलें ताकि कोई व्यक्ति हर बिंदु की पुष्टि करके हस्ताक्षर कर सके।",openList:"मानव समीक्षा चेकलिस्ट खोलें",took:"{s} सेकंड में जाँच पूरी हुई।",reading:"नियमों के अनुसार विज्ञापन पढ़ा जा रहा है...",slow:"(सामान्य से अधिक समय लग रहा है)",checking:"जाँच हो रही है...",checkBtn:"विज्ञापन जाँचें",gen:"सुधारा हुआ विज्ञापन बनाएँ",genning:"सुधारा हुआ विज्ञापन लिखा जा रहा है...",fixedH:"सुधारा हुआ विज्ञापन",headline:"शीर्षक",body:"मुख्य पाठ",cta:"कॉल टू एक्शन",fine:"छोटे अक्षरों की शर्तें",design:"ज़रूरी डिज़ाइन बदलाव",changes:"क्या बदला गया",copyAd:"सुधारा विज्ञापन कॉपी करें",dl:".txt डाउनलोड करें",regen:"फिर से बनाएँ",aiNote:"यह AI ने आपके नियमों के आधार पर लिखा है। उपयोग से पहले किसी व्यक्ति को इसकी समीक्षा करनी चाहिए।",rerun:"भाषा बदली गई है। इस भाषा में नतीजा पाने के लिए फिर से \"विज्ञापन जाँचें\" दबाएँ।",problem:"समस्या",fix:"सुधार",adLabel:"विज्ञापन",resLabel:"नतीजा"},
+    zh:{PASS:"通过",FAIL:"未通过",failOne:"请修改 1 处，然后重新检查",failMany:"请修改 {n} 处，然后重新检查",failNone:"该广告违反了公司规定",failSub:"每张卡片显示相关规定、广告中的问题以及修改方法。",howFix:"修改方法：",defFix:"修改广告使其不再违反此规定，然后重新检查。",copyFix:"复制修改清单",copied:"已复制",again:"上传修改后的广告",passTitle:"该广告符合公司规定",looked:"检查器查看的规定：",humanH:"请人工核实",humanP:"AI 可能会有疏漏。请在新标签页中打开清单，由人工逐项确认并签字。",openList:"打开人工审核清单",took:"检查用时 {s} 秒。",reading:"正在对照规定阅读广告...",slow:"（耗时比平时长）",checking:"检查中...",checkBtn:"检查广告",gen:"生成修正后的广告",genning:"正在撰写修正后的广告...",fixedH:"修正后的广告",headline:"标题",body:"正文",cta:"行动号召",fine:"细则说明",design:"需要的设计修改",changes:"修改内容",copyAd:"复制修正后的广告",dl:"下载 .txt",regen:"重新生成",aiNote:"由 AI 根据您的规定撰写，使用前请由人工审核。",rerun:"语言已更改。请再次点击“检查广告”以用此语言获取结果。",problem:"问题",fix:"修改",adLabel:"广告",resLabel:"结果"},
+    ja:{PASS:"合格",FAIL:"不合格",failOne:"1 件を修正してから、もう一度チェックしてください",failMany:"{n} 件を修正してから、もう一度チェックしてください",failNone:"この広告は社内ルールに違反しています",failSub:"各カードに、ルール、広告のどこが問題か、修正方法が表示されます。",howFix:"修正方法：",defFix:"このルールに違反しないよう広告を修正し、もう一度チェックしてください。",copyFix:"修正リストをコピー",copied:"コピーしました",again:"修正した広告をアップロード",passTitle:"この広告は社内ルールに適合しています",looked:"チェックしたルール：",humanH:"担当者による確認を行いましょう",humanP:"AI は見落とすことがあります。新しいタブでチェックリストを開き、担当者が各項目を確認して承認してください。",openList:"人による確認チェックリストを開く",took:"{s} 秒でチェックしました。",reading:"ルールに照らして広告を確認しています...",slow:"（通常より時間がかかっています）",checking:"チェック中...",checkBtn:"広告をチェック",gen:"修正版の広告を生成",genning:"修正版の広告を作成中...",fixedH:"修正版の広告",headline:"見出し",body:"本文",cta:"行動喚起",fine:"注意書き",design:"必要なデザイン変更",changes:"変更点",copyAd:"修正版をコピー",dl:".txt をダウンロード",regen:"もう一度生成",aiNote:"AI があなたのルールに基づいて作成しました。使用前に担当者が確認してください。",rerun:"言語が変更されました。この言語で結果を得るには、もう一度「広告をチェック」を押してください。",problem:"問題",fix:"修正",adLabel:"広告",resLabel:"結果"},
+    de:{PASS:"BESTANDEN",FAIL:"DURCHGEFALLEN",failOne:"1 Punkt beheben, dann erneut prüfen",failMany:"{n} Punkte beheben, dann erneut prüfen",failNone:"Diese Anzeige verstößt gegen die Unternehmensregeln",failSub:"Jede Karte zeigt die Regel, was in Ihrer Anzeige falsch ist und wie Sie es beheben.",howFix:"So beheben Sie es: ",defFix:"Ändern Sie die Anzeige so, dass sie diese Regel nicht mehr verletzt, und prüfen Sie erneut.",copyFix:"Korrekturliste kopieren",copied:"Kopiert",again:"Korrigierte Anzeige hochladen",passTitle:"Diese Anzeige entspricht den Unternehmensregeln",looked:"Vom Prüfer berücksichtigte Regeln:",humanH:"Von einer Person prüfen lassen",humanP:"Eine KI kann etwas übersehen. Öffnen Sie die Checkliste in einem neuen Tab, damit eine Person jeden Punkt bestätigt und abzeichnet.",openList:"Checkliste für die menschliche Prüfung öffnen",took:"Geprüft in {s} Sekunden.",reading:"Die Anzeige wird anhand der Regeln gelesen...",slow:"(dauert länger als üblich)",checking:"Wird geprüft...",checkBtn:"Anzeige prüfen",gen:"Korrigierte Anzeige erstellen",genning:"Korrigierte Anzeige wird geschrieben...",fixedH:"Korrigierte Anzeige",headline:"Überschrift",body:"Haupttext",cta:"Handlungsaufforderung",fine:"Kleingedrucktes",design:"Nötige Design-Änderungen",changes:"Was geändert wurde",copyAd:"Korrigierte Anzeige kopieren",dl:".txt herunterladen",regen:"Neu erstellen",aiNote:"Von einer KI anhand Ihrer Regeln geschrieben. Vor der Verwendung sollte eine Person sie prüfen.",rerun:"Die Sprache wurde geändert. Klicken Sie erneut auf „Anzeige prüfen“, um das Ergebnis in dieser Sprache zu erhalten.",problem:"Problem",fix:"Lösung",adLabel:"Anzeige",resLabel:"Ergebnis"},
+    ru:{PASS:"ПРОЙДЕНО",FAIL:"НЕ ПРОЙДЕНО",failOne:"Нужно исправить 1 пункт, затем проверьте снова",failMany:"Нужно исправить: {n}, затем проверьте снова",failNone:"Это объявление нарушает правила компании",failSub:"На каждой карточке указаны правило, что не так в объявлении и как это исправить.",howFix:"Как исправить: ",defFix:"Измените объявление так, чтобы оно не нарушало это правило, и проверьте снова.",copyFix:"Скопировать список исправлений",copied:"Скопировано",again:"Загрузить исправленное объявление",passTitle:"Это объявление соответствует правилам компании",looked:"Правила, по которым шла проверка:",humanH:"Пусть проверит человек",humanP:"ИИ может что-то упустить. Откройте чек-лист в новой вкладке, чтобы человек подтвердил каждый пункт и поставил подпись.",openList:"Открыть чек-лист проверки человеком",took:"Проверено за {s} с.",reading:"Объявление сверяется с правилами...",slow:"(дольше обычного)",checking:"Проверка...",checkBtn:"Проверить объявление",gen:"Создать исправленное объявление",genning:"Пишется исправленное объявление...",fixedH:"Исправленное объявление",headline:"Заголовок",body:"Основной текст",cta:"Призыв к действию",fine:"Мелкий шрифт",design:"Необходимые изменения дизайна",changes:"Что изменено",copyAd:"Скопировать исправленное объявление",dl:"Скачать .txt",regen:"Создать заново",aiNote:"Написано ИИ на основе ваших правил. Перед использованием его должен проверить человек.",rerun:"Язык изменён. Нажмите «Проверить объявление» ещё раз, чтобы получить результат на этом языке.",problem:"Проблема",fix:"Исправление",adLabel:"Объявление",resLabel:"Результат"}
+  };
+  var LANG="en", busy=false, last=null;
+  try{ LANG=localStorage.getItem("bg-lang")||"en"; }catch(e){}
+  if(!I18N[LANG]) LANG="en";
+  function t(k,v){
+    var s=(I18N[LANG]&&I18N[LANG][k])||I18N.en[k]||k;
+    if(v) Object.keys(v).forEach(function(n){ s=s.replace("{"+n+"}",v[n]); });
+    return s;
+  }
+  var langSel=$("lang");
+  langSel.value=LANG; document.documentElement.lang=LANG;
+  go.textContent=t("checkBtn");
+  langSel.addEventListener("change",function(){
+    LANG=langSel.value; document.documentElement.lang=LANG;
+    try{ localStorage.setItem("bg-lang",LANG); }catch(e){}
+    go.textContent=busy?t("checking"):t("checkBtn");
+    if(last && !busy){
+      var note=h("p",{class:"fine",text:t("rerun")});
+      if(last.kind==="fail") renderFail(last.d,note); else renderPass(last.d,note);
+    }
+  });
+
   function stamp(v){
-    return h("div",{class:"stampwrap"},[h("span",{class:"stamp "+(v==="PASS"?"pass":"fail")+" slam",text:v})]);
+    var w=t(v);
+    return h("div",{class:"stampwrap"},[h("span",{class:"stamp "+(v==="PASS"?"pass":"fail")+" slam"+(w.length>8?" long":""),text:w})]);
   }
 
   function fixText(d){
-    var lines=["Ad: "+adFile.name,"Result: FAIL",""];
+    var lines=[t("adLabel")+": "+adFile.name,t("resLabel")+": "+t("FAIL"),""];
     d.violations.forEach(function(v,i){
       lines.push((i+1)+". "+v.rule);
-      lines.push("   Problem: "+v.reason);
-      lines.push("   Fix: "+(v.fix||"Change the ad so it no longer breaks this rule."));
+      lines.push("   "+t("problem")+": "+v.reason);
+      lines.push("   "+t("fix")+": "+(v.fix||t("defFix")));
       lines.push("");
     });
     return lines.join("\n");
@@ -916,67 +1120,147 @@ h1.wordmark{font:800 clamp(40px,6.4vw,74px)/1.02 var(--display);letter-spacing:-
     if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(ok,fallback); } else fallback();
   }
 
-  function took(d){ return d.seconds?h("p",{class:"fine",text:"Checked in "+d.seconds+" seconds."}):null; }
+  function took(d){ return d.seconds?h("p",{class:"fine",text:t("took",{s:d.seconds})}):null; }
 
-  function renderFail(d){
+  /* ---------- corrected ad (generative AI) ---------- */
+  function fixAdText(f){
+    var L=[];
+    if(f.headline) L.push(f.headline,"");
+    if(f.body) L.push(f.body,"");
+    if(f.call_to_action) L.push(f.call_to_action,"");
+    if(f.fine_print) L.push(f.fine_print,"");
+    return L.join("\n").trim();
+  }
+  function fullFixText(f){
+    var L=[fixAdText(f)];
+    if(f.design_changes.length){ L.push("","== "+t("design")+" =="); f.design_changes.forEach(function(x){L.push("- "+x);}); }
+    if(f.changes.length){ L.push("","== "+t("changes")+" =="); f.changes.forEach(function(x){L.push("- "+x);}); }
+    return L.join("\n");
+  }
+  function renderFix(f,out){
+    var card=h("div",{class:"fixed"});
+    card.appendChild(h("h3",{class:"fixed-h",text:t("fixedH")}));
+    var ad=h("div",{class:"adcard"});
+    if(f.headline) ad.appendChild(h("h4",{class:"ad-h",text:f.headline}));
+    if(f.body) ad.appendChild(h("p",{class:"ad-b",text:f.body}));
+    if(f.call_to_action) ad.appendChild(h("span",{class:"ad-cta",text:f.call_to_action}));
+    if(f.fine_print) ad.appendChild(h("p",{class:"ad-fine",text:f.fine_print}));
+    card.appendChild(ad);
+    function list(title,items){
+      if(!items.length) return;
+      var ul=h("ul",{class:"fixlist"});
+      items.forEach(function(x){ ul.appendChild(h("li",{text:x})); });
+      card.appendChild(h("h4",{class:"fl-h",text:title})); card.appendChild(ul);
+    }
+    list(t("design"),f.design_changes); list(t("changes"),f.changes);
+    var cp=h("button",{class:"btn ghost",type:"button",text:t("copyAd")});
+    cp.addEventListener("click",function(){ copy(fullFixText(f),cp,t("copied")); });
+    var dl=h("button",{class:"btn ghost",type:"button"},[icon("download"),t("dl")]);
+    dl.addEventListener("click",function(){
+      var blob=new Blob([fullFixText(f)],{type:"text/plain;charset=utf-8"});
+      var a=h("a",{href:URL.createObjectURL(blob),download:adFile.name.replace(/\.[^.]+$/,"")+"-corrected.txt"});
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function(){URL.revokeObjectURL(a.href);},1000);
+    });
+    card.appendChild(h("div",{class:"actions"},[cp,dl]));
+    card.appendChild(h("p",{class:"fine",text:t("aiNote")}));
+    out.appendChild(card);
+    card.scrollIntoView({block:"nearest",behavior:"smooth"});
+  }
+  function generateFix(d,btn,lab,out){
+    var fd=new FormData();
+    fd.append("ad",adFile);
+    if(policyFile) fd.append("policy",policyFile); else fd.append("policy_text",$("policyText").value);
+    fd.append("violations",JSON.stringify(d.violations));
+    fd.append("lang",LANG);
+    btn.disabled=true;
+    out.textContent="";
+    out.appendChild(h("div",{class:"working"},[h("span",{class:"spin"}),h("p",{text:t("genning")})]));
+    var ac=new AbortController(), killer=setTimeout(function(){ac.abort();},150000);
+    fetch("/api/fix",{method:"POST",body:fd,signal:ac.signal}).then(function(r){
+      return r.json().then(function(j){return {ok:r.ok,body:j};});
+    }).then(function(res){
+      out.textContent="";
+      if(!res.ok){ out.appendChild(h("p",{class:"err",text:res.body.error||"Something went wrong. Try again."})); return; }
+      renderFix(res.body,out); lab.textContent=t("regen");
+    }).catch(function(e){
+      out.textContent="";
+      out.appendChild(h("p",{class:"err",text:(e&&e.name==="AbortError")?"This is taking too long. Try again.":"Could not reach the app. Check that it is still running, then try again."}));
+    }).then(function(){ clearTimeout(killer); btn.disabled=false; });
+  }
+
+  function renderFail(d,note){
+    last={kind:"fail",d:d};
     sheet.className="sheet fail";
     var box=h("div"), n=d.violations.length;
     box.appendChild(stamp("FAIL"));
-    box.appendChild(h("h3",{class:"vtitle",text:n?("Fix "+n+(n===1?" thing":" things")+", then check again"):"This ad breaks the company's rules"}));
-    box.appendChild(h("p",{class:"vsub",text:"Each card shows the rule, what is wrong in your ad, and how to fix it."}));
+    box.appendChild(h("h3",{class:"vtitle",text:n?(n===1?t("failOne"):t("failMany",{n:n})):t("failNone")}));
+    box.appendChild(h("p",{class:"vsub",text:t("failSub")}));
     var ul=h("ul",{class:"vlist"});
     d.violations.forEach(function(v){
-      var fix=v.fix||"Change the ad so it no longer breaks this rule, then check again.";
+      var fix=v.fix||t("defFix");
       ul.appendChild(h("li",{class:"vcard"},[
-        h("h4",{text:v.rule||"Rule not named"}),
+        h("h4",{text:v.rule||"-"}),
         h("p",{class:"wrong",text:v.reason}),
-        h("div",{class:"fixbox"},[icon("edit"),h("div",{},[h("strong",{text:"How to fix: "}),fix])])
+        h("div",{class:"fixbox"},[icon("edit"),h("div",{},[h("strong",{text:t("howFix")}),fix])])
       ]));
     });
     box.appendChild(ul);
-    var copyBtn=h("button",{class:"btn ghost",type:"button",text:"Copy fix list"});
-    copyBtn.addEventListener("click",function(){copy(fixText(d),copyBtn,"Copied");});
-    var again=h("button",{class:"btn",type:"button"},[icon("upload"),"Upload the fixed ad"]);
+    if(n){
+      var lab=h("span",{text:t("gen")});
+      var genBtn=h("button",{class:"btn gen",type:"button"},[icon("sparkle"),lab]);
+      var out=h("div",{class:"fixout"});
+      genBtn.addEventListener("click",function(){ generateFix(d,genBtn,lab,out); });
+      box.appendChild(genBtn); box.appendChild(out);
+    }
+    var copyBtn=h("button",{class:"btn ghost",type:"button",text:t("copyFix")});
+    copyBtn.addEventListener("click",function(){copy(fixText(d),copyBtn,t("copied"));});
+    var again=h("button",{class:"btn",type:"button"},[icon("upload"),t("again")]);
     again.addEventListener("click",function(){ $("adFile").click(); });
     box.appendChild(h("div",{class:"actions"},[again,copyBtn]));
     var t1=took(d); if(t1) box.appendChild(t1);
+    if(note) box.appendChild(note);
     show(box);
   }
 
-  function renderPass(d){
+  function renderPass(d,note){
+    last={kind:"pass",d:d};
     sheet.className="sheet pass";
     var box=h("div");
     box.appendChild(stamp("PASS"));
-    box.appendChild(h("h3",{class:"vtitle",text:"This ad follows the company's rules"}));
+    box.appendChild(h("h3",{class:"vtitle",text:t("passTitle")}));
     if(d.checked&&d.checked.length){
-      box.appendChild(h("p",{class:"vsub",text:"Rules the checker looked at:"}));
+      box.appendChild(h("p",{class:"vsub",text:t("looked")}));
       var ul=h("ul",{class:"checked"});
       d.checked.forEach(function(r){ ul.appendChild(h("li",{},[icon("check"),h("span",{text:r})])); });
       box.appendChild(ul);
     }
     var payload={ad:adFile.name,at:new Date().toISOString(),by:state.by,rules:d.checked||[]};
     var href="/review#d="+encodeURIComponent(JSON.stringify(payload));
-    var link=h("a",{class:"btn green",href:href,target:"_blank",rel:"noopener"},["Open human review checklist",icon("external")]);
+    var link=h("a",{class:"btn green",href:href,target:"_blank",rel:"noopener"},[t("openList"),icon("external")]);
     box.appendChild(h("div",{class:"human"},[
-      h("div",{class:"row"},[icon("person"),h("div",{},[h("h4",{text:"Get it verified by a person",style:"font:800 18px/1.2 var(--display);margin-bottom:4px"}),h("p",{text:"An AI can miss things. Open the checklist in a new tab so a person can confirm each point and sign off."})])]),
+      h("div",{class:"row"},[icon("person"),h("div",{},[h("h4",{text:t("humanH"),style:"font:800 18px/1.2 var(--display);margin-bottom:4px"}),h("p",{text:t("humanP")})])]),
       link
     ]));
     var t2=took(d); if(t2) box.appendChild(t2);
+    if(note) box.appendChild(note);
     show(box);
-    if(window.__confetti) window.__confetti();
+    if(!note && window.__confetti) window.__confetti();
   }
 
   go.addEventListener("click",function(){
     var fd=new FormData();
     fd.append("ad",adFile);
     if(policyFile) fd.append("policy",policyFile); else fd.append("policy_text",$("policyText").value);
-    go.disabled=true; go.textContent="Checking...";
+    fd.append("lang",LANG);
+    busy=true; last=null;
+    go.disabled=true; go.textContent=t("checking");
     sheet.className="sheet"; stage.classList.add("scanning");
-    var t0=Date.now(), msg=h("p",{text:"Reading the ad against the rules..."});
+    var t0=Date.now(), msg=h("p",{text:t("reading")});
     show(h("div",{class:"working"},[h("span",{class:"spin"}),msg]));
     var timer=setInterval(function(){
       var sec=Math.round((Date.now()-t0)/1000);
-      msg.textContent="Reading the ad against the rules... "+sec+"s"+(sec>25?" (taking longer than usual)":"");
+      msg.textContent=t("reading")+" "+sec+"s"+(sec>25?" "+t("slow"):"");
     },1000);
     var ac=new AbortController(), killer=setTimeout(function(){ac.abort();},150000);
 
@@ -991,7 +1275,7 @@ h1.wordmark{font:800 clamp(40px,6.4vw,74px)/1.02 var(--display);letter-spacing:-
         : "Could not reach the app. Check that it is still running, then try again."}));
     }).then(function(){
       clearInterval(timer); clearTimeout(killer);
-      stage.classList.remove("scanning"); go.textContent="Check ad"; refresh();
+      busy=false; stage.classList.remove("scanning"); go.textContent=t("checkBtn"); refresh();
       if(window.matchMedia("(max-width:860px)").matches){ sheet.scrollIntoView({block:"start"}); }
     });
   });
@@ -1164,11 +1448,11 @@ REVIEW_PAGE = r"""<!doctype html>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%2312805F'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Syne:wght@600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#F4F5FB;--surface:#fff;--ink:#111A36;--muted:#5A6482;--line:#DCE0EE;--brand:#4A3FE0;--brand-soft:#E9E7FD;
   --pass:#12805F;--pass-soft:#DFF4EC;--fail:#C7372B;--focus:#1F6FEB;
-  --display:"Syne",system-ui,sans-serif;--body:"Instrument Sans",system-ui,sans-serif;
+  --display:"Plus Jakarta Sans","Instrument Sans",system-ui,sans-serif;--body:"Instrument Sans",system-ui,sans-serif;
   --shadow:0 1px 2px rgba(17,26,54,.06),0 14px 30px -18px rgba(74,63,224,.35)}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
