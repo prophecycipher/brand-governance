@@ -556,8 +556,15 @@ def fix_image():
     except UserError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
+        msg = str(e)
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower():
+            return jsonify({"error": (
+                "Image generation is out of quota on this Gemini key. Free keys have little or no "
+                "image quota, and it resets daily. Try again later, or enable billing on the key. "
+                "The corrected ad text above still works."
+            )}), 429
         return jsonify({"error": (
-            f"The ad image could not be generated: {str(e)[:250]} "
+            f"The ad image could not be generated: {msg[:250]} "
             "(If the model name is wrong or unavailable on your key, set GEMINI_IMAGE_MODEL.)"
         )}), 502
 
