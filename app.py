@@ -32,6 +32,10 @@ GEMINI_FALLBACK = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-lat
 # Seconds to wait for ONE Gemini call before giving up on it.
 GEMINI_TIMEOUT_MS = int(float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "45")) * 1000)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+# Image generation (Gemini only). Change these if Google renames the models.
+IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
+IMAGE_FALLBACK = os.environ.get("GEMINI_IMAGE_FALLBACK_MODEL", "gemini-2.5-flash-image")
+IMAGE_TIMEOUT_MS = int(float(os.environ.get("IMAGE_TIMEOUT_SECONDS", "120")) * 1000)
 
 # Languages the verdict (and the corrected ad) can be written in.
 LANGUAGES = {
@@ -82,6 +86,7 @@ keeping the original message, offer, tone and purpose as close as possible.
 
 Rules:
 - Use ONLY the policy provided. Do not invent rules or facts.
+- Keep headline, body, call_to_action and fine_print in the SAME language as the original ad.
 - Do not invent prices, dates, statistics or claims that are not in the
   original ad. If a required element needs information you do not have
   (for example a legal disclaimer's exact text), use a clear placeholder in
@@ -218,20 +223,22 @@ def parse_result(text):
     return {"verdict": verdict, "checked": checked, "violations": clean}
 
 
-def _gemini_client():
+def _gemini_client(timeout_ms=None):
     from google import genai
     from google.genai import types
+
+    tm = timeout_ms or GEMINI_TIMEOUT_MS
 
     key = os.environ["GEMINI_API_KEY"]
     try:
         # attempts=1 turns off the library's default of 5 slow automatic retries.
         opts = types.HttpOptions(
-            timeout=GEMINI_TIMEOUT_MS,
+            timeout=tm,
             retry_options=types.HttpRetryOptions(attempts=1),
         )
     except Exception:
         try:
-            opts = types.HttpOptions(timeout=GEMINI_TIMEOUT_MS)
+            opts = types.HttpOptions(timeout=tm)
         except Exception:
             opts = None
     return genai.Client(api_key=key, http_options=opts) if opts else genai.Client(api_key=key)
@@ -332,6 +339,16 @@ def run_check(policy, ad, lang="en"):
     raise UserError(NO_KEY)
 
 
+def fix_language_note(lang):
+    name = LANGUAGES.get(lang, "English")
+    if name == "English":
+        return ""
+    return (
+        "\n\nLANGUAGE: Keep the ad copy in the original ad's language. "
+        f"Write only the 'design_changes' and 'changes' lists in {name}."
+    )
+
+
 def parse_fix(text):
     text = (text or "").strip()
     if text.startswith("```"):
@@ -361,7 +378,7 @@ def parse_fix(text):
 
 def run_fix(policy, ad, violations, lang="en"):
     which = provider()
-    system = FIX_PROMPT + language_note(lang)
+    system = FIX_PROMPT + fix_language_note(lang)
     closing = (
         "VIOLATIONS FOUND IN THE AD:\n"
         + json.dumps(violations, ensure_ascii=False, indent=2)
@@ -372,6 +389,76 @@ def run_fix(policy, ad, violations, lang="en"):
     if which == "claude":
         return parse_fix(run_claude(policy, ad, system=system, closing=closing))
     raise UserError(NO_KEY)
+
+
+def build_image_prompt(fix, violations, has_reference):
+    lines = []
+    if has_reference:
+        lines.append(
+            "Redesign the attached advertisement so that it follows the company's rules. Keep its overall "
+            "layout, brand colors, imagery, fonts and style as close to the original as possible, "
+            "changing only what is needed."
+        )
+    else:
+        lines.append("Create a finished, professional advertisement image.")
+    lines.append("Show EXACTLY this text in the ad, spelled exactly as written, and no other text:")
+    for label, key in (
+        ("Headline", "headline"),
+        ("Body", "body"),
+        ("Call-to-action button", "call_to_action"),
+        ("Fine print (small text at the bottom)", "fine_print"),
+    ):
+        if fix.get(key):
+            lines.append(f'- {label}: "{fix[key]}"')
+    if fix.get("design_changes"):
+        lines.append("Also make these design changes:")
+        lines += [f"- {x}" for x in fix["design_changes"]]
+    bad = [v for v in violations if isinstance(v, dict)]
+    if bad:
+        lines.append("The old version broke these rules, so none of this may appear again:")
+        lines += [f"- {v.get('rule', '')}: {v.get('reason', '')}" for v in bad]
+    lines.append(
+        "Do not invent logos, brand names, prices, claims or badges. If a required logo is not in the "
+        "reference image, leave a plain empty space for it."
+    )
+    lines.append("Output the finished advertisement as a single image.")
+    return "\n".join(lines)
+
+
+def run_image(ad, fix, violations):
+    if provider() != "gemini":
+        raise UserError("Image generation needs a Gemini key (GEMINI_API_KEY). Claude models cannot generate images.")
+    from google.genai import types
+
+    has_ref = ad[0] == "file" and str(ad[2]).startswith("image/")
+    contents = [build_image_prompt(fix, violations, has_ref)]
+    if has_ref:
+        contents.append(types.Part.from_bytes(data=ad[1], mime_type=ad[2]))
+    client = _gemini_client(IMAGE_TIMEOUT_MS)
+    models = [IMAGE_MODEL] + ([IMAGE_FALLBACK] if IMAGE_FALLBACK and IMAGE_FALLBACK != IMAGE_MODEL else [])
+    first_error = None
+    text_reply = ""
+    for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+            )
+        except Exception as e:
+            first_error = first_error or e
+            continue
+        for part in getattr(response, "parts", None) or []:
+            inline = getattr(part, "inline_data", None)
+            if inline is not None and inline.data:
+                mime = inline.mime_type or "image/png"
+                data = base64.b64encode(inline.data).decode()
+                return {"image": f"data:{mime};base64,{data}", "mime": mime, "model": model}
+            if getattr(part, "text", None):
+                text_reply = part.text
+    if first_error and not text_reply:
+        raise first_error
+    raise UserError("The AI did not return an image." + (f" It said: {text_reply[:200]}" if text_reply else " Try again."))
 
 
 def read_policy_from_request():
@@ -395,7 +482,7 @@ def status():
     which = provider()
     name = "brand-governance"
     by = {"gemini": "Google Gemini", "claude": "Claude"}.get(which, "AI")
-    return jsonify({"provider": which, "name": name, "by": by, "languages": LANGUAGES})
+    return jsonify({"provider": which, "name": name, "by": by, "languages": LANGUAGES, "image": which == "gemini"})
 
 
 @app.post("/api/check")
@@ -442,6 +529,37 @@ def fix():
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": f"The corrected ad could not be generated: {str(e)[:300]}"}), 502
+
+
+@app.post("/api/fix-image")
+def fix_image():
+    """Generate an actual corrected ad image (Gemini image model)."""
+    try:
+        ad_file = request.files.get("ad")
+        if not ad_file or not ad_file.filename:
+            raise UserError("Add the advertisement first.")
+        try:
+            fix = json.loads(request.form.get("fix") or "{}")
+            violations = json.loads(request.form.get("violations") or "[]")
+        except json.JSONDecodeError:
+            raise UserError("Generate the corrected ad text first.")
+        if not isinstance(fix, dict) or not any(fix.get(k) for k in ("headline", "body", "call_to_action")):
+            raise UserError("Generate the corrected ad text first.")
+        if not isinstance(violations, list):
+            violations = []
+        ad = read_upload(ad_file)
+        started = time.time()
+        result = run_image(ad, fix, violations)
+        result["seconds"] = round(time.time() - started, 1)
+        print(f"[image] {result['model']} answered in {result['seconds']}s", flush=True)
+        return jsonify(result)
+    except UserError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": (
+            f"The ad image could not be generated: {str(e)[:250]} "
+            "(If the model name is wrong or unavailable on your key, set GEMINI_IMAGE_MODEL.)"
+        )}), 502
 
 
 @app.errorhandler(413)
@@ -740,6 +858,8 @@ h1.wordmark{font-weight:800;letter-spacing:-.045em;line-height:1}
 .ad-cta{justify-self:start;background:var(--brand);color:#fff;font-weight:700;border-radius:999px;padding:8px 18px}
 .ad-fine{color:var(--muted);font-size:13px;white-space:pre-wrap}
 .fl-h{font:800 16px/1.2 var(--display);margin:16px 0 6px;letter-spacing:-.01em}
+.imgbox{margin-top:14px}
+.imgbox img{display:block;max-width:100%;border-radius:12px;border:1px solid var(--line);margin-top:10px;background:#fff}
 .fixlist{margin:0;padding-left:20px;display:grid;gap:5px;color:#33405E}
 </style>
 </head>
@@ -1001,9 +1121,9 @@ h1.wordmark{font-weight:800;letter-spacing:-.045em;line-height:1}
   apply();
 
   /* ---------- status ---------- */
-  var state={provider:null,by:"AI"};
+  var state={provider:null,by:"AI",image:false};
   fetch("/api/status").then(function(r){return r.json()}).then(function(s){
-    state.provider=s.provider; state.by=s.by;
+    state.provider=s.provider; state.by=s.by; state.image=!!s.image;
     $("appname").textContent=s.name; document.title=s.name;
     if(!s.provider){
       var b=$("banner"); b.hidden=false;
@@ -1067,12 +1187,12 @@ h1.wordmark{font-weight:800;letter-spacing:-.045em;line-height:1}
   /* ---------- check ---------- */
   /* ---------- verdict language ---------- */
   var I18N={
-    en:{PASS:"PASS",FAIL:"FAIL",failOne:"Fix 1 thing, then check again",failMany:"Fix {n} things, then check again",failNone:"This ad breaks the company's rules",failSub:"Each card shows the rule, what is wrong in your ad, and how to fix it.",howFix:"How to fix: ",defFix:"Change the ad so it no longer breaks this rule, then check again.",copyFix:"Copy fix list",copied:"Copied",again:"Upload the fixed ad",passTitle:"This ad follows the company's rules",looked:"Rules the checker looked at:",humanH:"Get it verified by a person",humanP:"An AI can miss things. Open the checklist in a new tab so a person can confirm each point and sign off.",openList:"Open human review checklist",took:"Checked in {s} seconds.",reading:"Reading the ad against the rules...",slow:"(taking longer than usual)",checking:"Checking...",checkBtn:"Check ad",gen:"Generate corrected ad",genning:"Writing a corrected ad...",fixedH:"Corrected ad",headline:"Headline",body:"Body text",cta:"Call to action",fine:"Fine print",design:"Design changes needed",changes:"What was changed",copyAd:"Copy corrected ad",dl:"Download .txt",regen:"Generate again",aiNote:"Written by AI from your rules. A person should review it before it is used.",rerun:"The language was changed. Press Check ad again to get the verdict in this language.",problem:"Problem",fix:"Fix",adLabel:"Ad",resLabel:"Result"},
-    hi:{PASS:"पास",FAIL:"फेल",failOne:"1 बात ठीक करें, फिर दोबारा जाँचें",failMany:"{n} बातें ठीक करें, फिर दोबारा जाँचें",failNone:"यह विज्ञापन कंपनी के नियमों का उल्लंघन करता है",failSub:"हर कार्ड में नियम, आपके विज्ञापन में क्या गलत है और उसे कैसे ठीक करें, यह दिया गया है।",howFix:"ठीक कैसे करें: ",defFix:"विज्ञापन में ऐसा बदलाव करें कि वह इस नियम का उल्लंघन न करे, फिर दोबारा जाँचें।",copyFix:"सुधार सूची कॉपी करें",copied:"कॉपी हो गया",again:"सुधारा हुआ विज्ञापन अपलोड करें",passTitle:"यह विज्ञापन कंपनी के नियमों का पालन करता है",looked:"जाँचकर्ता ने ये नियम देखे:",humanH:"किसी व्यक्ति से सत्यापित करवाएँ",humanP:"AI से चूक हो सकती है। नए टैब में चेकलिस्ट खोलें ताकि कोई व्यक्ति हर बिंदु की पुष्टि करके हस्ताक्षर कर सके।",openList:"मानव समीक्षा चेकलिस्ट खोलें",took:"{s} सेकंड में जाँच पूरी हुई।",reading:"नियमों के अनुसार विज्ञापन पढ़ा जा रहा है...",slow:"(सामान्य से अधिक समय लग रहा है)",checking:"जाँच हो रही है...",checkBtn:"विज्ञापन जाँचें",gen:"सुधारा हुआ विज्ञापन बनाएँ",genning:"सुधारा हुआ विज्ञापन लिखा जा रहा है...",fixedH:"सुधारा हुआ विज्ञापन",headline:"शीर्षक",body:"मुख्य पाठ",cta:"कॉल टू एक्शन",fine:"छोटे अक्षरों की शर्तें",design:"ज़रूरी डिज़ाइन बदलाव",changes:"क्या बदला गया",copyAd:"सुधारा विज्ञापन कॉपी करें",dl:".txt डाउनलोड करें",regen:"फिर से बनाएँ",aiNote:"यह AI ने आपके नियमों के आधार पर लिखा है। उपयोग से पहले किसी व्यक्ति को इसकी समीक्षा करनी चाहिए।",rerun:"भाषा बदली गई है। इस भाषा में नतीजा पाने के लिए फिर से \"विज्ञापन जाँचें\" दबाएँ।",problem:"समस्या",fix:"सुधार",adLabel:"विज्ञापन",resLabel:"नतीजा"},
-    zh:{PASS:"通过",FAIL:"未通过",failOne:"请修改 1 处，然后重新检查",failMany:"请修改 {n} 处，然后重新检查",failNone:"该广告违反了公司规定",failSub:"每张卡片显示相关规定、广告中的问题以及修改方法。",howFix:"修改方法：",defFix:"修改广告使其不再违反此规定，然后重新检查。",copyFix:"复制修改清单",copied:"已复制",again:"上传修改后的广告",passTitle:"该广告符合公司规定",looked:"检查器查看的规定：",humanH:"请人工核实",humanP:"AI 可能会有疏漏。请在新标签页中打开清单，由人工逐项确认并签字。",openList:"打开人工审核清单",took:"检查用时 {s} 秒。",reading:"正在对照规定阅读广告...",slow:"（耗时比平时长）",checking:"检查中...",checkBtn:"检查广告",gen:"生成修正后的广告",genning:"正在撰写修正后的广告...",fixedH:"修正后的广告",headline:"标题",body:"正文",cta:"行动号召",fine:"细则说明",design:"需要的设计修改",changes:"修改内容",copyAd:"复制修正后的广告",dl:"下载 .txt",regen:"重新生成",aiNote:"由 AI 根据您的规定撰写，使用前请由人工审核。",rerun:"语言已更改。请再次点击“检查广告”以用此语言获取结果。",problem:"问题",fix:"修改",adLabel:"广告",resLabel:"结果"},
-    ja:{PASS:"合格",FAIL:"不合格",failOne:"1 件を修正してから、もう一度チェックしてください",failMany:"{n} 件を修正してから、もう一度チェックしてください",failNone:"この広告は社内ルールに違反しています",failSub:"各カードに、ルール、広告のどこが問題か、修正方法が表示されます。",howFix:"修正方法：",defFix:"このルールに違反しないよう広告を修正し、もう一度チェックしてください。",copyFix:"修正リストをコピー",copied:"コピーしました",again:"修正した広告をアップロード",passTitle:"この広告は社内ルールに適合しています",looked:"チェックしたルール：",humanH:"担当者による確認を行いましょう",humanP:"AI は見落とすことがあります。新しいタブでチェックリストを開き、担当者が各項目を確認して承認してください。",openList:"人による確認チェックリストを開く",took:"{s} 秒でチェックしました。",reading:"ルールに照らして広告を確認しています...",slow:"（通常より時間がかかっています）",checking:"チェック中...",checkBtn:"広告をチェック",gen:"修正版の広告を生成",genning:"修正版の広告を作成中...",fixedH:"修正版の広告",headline:"見出し",body:"本文",cta:"行動喚起",fine:"注意書き",design:"必要なデザイン変更",changes:"変更点",copyAd:"修正版をコピー",dl:".txt をダウンロード",regen:"もう一度生成",aiNote:"AI があなたのルールに基づいて作成しました。使用前に担当者が確認してください。",rerun:"言語が変更されました。この言語で結果を得るには、もう一度「広告をチェック」を押してください。",problem:"問題",fix:"修正",adLabel:"広告",resLabel:"結果"},
-    de:{PASS:"BESTANDEN",FAIL:"DURCHGEFALLEN",failOne:"1 Punkt beheben, dann erneut prüfen",failMany:"{n} Punkte beheben, dann erneut prüfen",failNone:"Diese Anzeige verstößt gegen die Unternehmensregeln",failSub:"Jede Karte zeigt die Regel, was in Ihrer Anzeige falsch ist und wie Sie es beheben.",howFix:"So beheben Sie es: ",defFix:"Ändern Sie die Anzeige so, dass sie diese Regel nicht mehr verletzt, und prüfen Sie erneut.",copyFix:"Korrekturliste kopieren",copied:"Kopiert",again:"Korrigierte Anzeige hochladen",passTitle:"Diese Anzeige entspricht den Unternehmensregeln",looked:"Vom Prüfer berücksichtigte Regeln:",humanH:"Von einer Person prüfen lassen",humanP:"Eine KI kann etwas übersehen. Öffnen Sie die Checkliste in einem neuen Tab, damit eine Person jeden Punkt bestätigt und abzeichnet.",openList:"Checkliste für die menschliche Prüfung öffnen",took:"Geprüft in {s} Sekunden.",reading:"Die Anzeige wird anhand der Regeln gelesen...",slow:"(dauert länger als üblich)",checking:"Wird geprüft...",checkBtn:"Anzeige prüfen",gen:"Korrigierte Anzeige erstellen",genning:"Korrigierte Anzeige wird geschrieben...",fixedH:"Korrigierte Anzeige",headline:"Überschrift",body:"Haupttext",cta:"Handlungsaufforderung",fine:"Kleingedrucktes",design:"Nötige Design-Änderungen",changes:"Was geändert wurde",copyAd:"Korrigierte Anzeige kopieren",dl:".txt herunterladen",regen:"Neu erstellen",aiNote:"Von einer KI anhand Ihrer Regeln geschrieben. Vor der Verwendung sollte eine Person sie prüfen.",rerun:"Die Sprache wurde geändert. Klicken Sie erneut auf „Anzeige prüfen“, um das Ergebnis in dieser Sprache zu erhalten.",problem:"Problem",fix:"Lösung",adLabel:"Anzeige",resLabel:"Ergebnis"},
-    ru:{PASS:"ПРОЙДЕНО",FAIL:"НЕ ПРОЙДЕНО",failOne:"Нужно исправить 1 пункт, затем проверьте снова",failMany:"Нужно исправить: {n}, затем проверьте снова",failNone:"Это объявление нарушает правила компании",failSub:"На каждой карточке указаны правило, что не так в объявлении и как это исправить.",howFix:"Как исправить: ",defFix:"Измените объявление так, чтобы оно не нарушало это правило, и проверьте снова.",copyFix:"Скопировать список исправлений",copied:"Скопировано",again:"Загрузить исправленное объявление",passTitle:"Это объявление соответствует правилам компании",looked:"Правила, по которым шла проверка:",humanH:"Пусть проверит человек",humanP:"ИИ может что-то упустить. Откройте чек-лист в новой вкладке, чтобы человек подтвердил каждый пункт и поставил подпись.",openList:"Открыть чек-лист проверки человеком",took:"Проверено за {s} с.",reading:"Объявление сверяется с правилами...",slow:"(дольше обычного)",checking:"Проверка...",checkBtn:"Проверить объявление",gen:"Создать исправленное объявление",genning:"Пишется исправленное объявление...",fixedH:"Исправленное объявление",headline:"Заголовок",body:"Основной текст",cta:"Призыв к действию",fine:"Мелкий шрифт",design:"Необходимые изменения дизайна",changes:"Что изменено",copyAd:"Скопировать исправленное объявление",dl:"Скачать .txt",regen:"Создать заново",aiNote:"Написано ИИ на основе ваших правил. Перед использованием его должен проверить человек.",rerun:"Язык изменён. Нажмите «Проверить объявление» ещё раз, чтобы получить результат на этом языке.",problem:"Проблема",fix:"Исправление",adLabel:"Объявление",resLabel:"Результат"}
+    en:{PASS:"PASS",FAIL:"FAIL",failOne:"Fix 1 thing, then check again",failMany:"Fix {n} things, then check again",failNone:"This ad breaks the company's rules",failSub:"Each card shows the rule, what is wrong in your ad, and how to fix it.",howFix:"How to fix: ",defFix:"Change the ad so it no longer breaks this rule, then check again.",copyFix:"Copy fix list",copied:"Copied",again:"Upload the fixed ad",passTitle:"This ad follows the company's rules",looked:"Rules the checker looked at:",humanH:"Get it verified by a person",humanP:"An AI can miss things. Open the checklist in a new tab so a person can confirm each point and sign off.",openList:"Open human review checklist",took:"Checked in {s} seconds.",reading:"Reading the ad against the rules...",slow:"(taking longer than usual)",checking:"Checking...",checkBtn:"Check ad",gen:"Generate corrected ad",genning:"Writing a corrected ad...",fixedH:"Corrected ad",headline:"Headline",body:"Body text",cta:"Call to action",fine:"Fine print",design:"Design changes needed",changes:"What was changed",copyAd:"Copy corrected ad",dl:"Download .txt",regen:"Generate again",aiNote:"Written by AI from your rules. A person should review it before it is used.",rerun:"The language was changed. Press Check ad again to get the verdict in this language.",problem:"Problem",fix:"Fix",adLabel:"Ad",resLabel:"Result",img:"AI-generated corrected ad",imgWorking:"Generating the corrected ad image... this can take up to a minute",imgDl:"Download image",imgRegen:"Regenerate image",imgNote:"AI-generated image. Check every word in it carefully before using it."},
+    hi:{PASS:"पास",FAIL:"फेल",failOne:"1 बात ठीक करें, फिर दोबारा जाँचें",failMany:"{n} बातें ठीक करें, फिर दोबारा जाँचें",failNone:"यह विज्ञापन कंपनी के नियमों का उल्लंघन करता है",failSub:"हर कार्ड में नियम, आपके विज्ञापन में क्या गलत है और उसे कैसे ठीक करें, यह दिया गया है।",howFix:"ठीक कैसे करें: ",defFix:"विज्ञापन में ऐसा बदलाव करें कि वह इस नियम का उल्लंघन न करे, फिर दोबारा जाँचें।",copyFix:"सुधार सूची कॉपी करें",copied:"कॉपी हो गया",again:"सुधारा हुआ विज्ञापन अपलोड करें",passTitle:"यह विज्ञापन कंपनी के नियमों का पालन करता है",looked:"जाँचकर्ता ने ये नियम देखे:",humanH:"किसी व्यक्ति से सत्यापित करवाएँ",humanP:"AI से चूक हो सकती है। नए टैब में चेकलिस्ट खोलें ताकि कोई व्यक्ति हर बिंदु की पुष्टि करके हस्ताक्षर कर सके।",openList:"मानव समीक्षा चेकलिस्ट खोलें",took:"{s} सेकंड में जाँच पूरी हुई।",reading:"नियमों के अनुसार विज्ञापन पढ़ा जा रहा है...",slow:"(सामान्य से अधिक समय लग रहा है)",checking:"जाँच हो रही है...",checkBtn:"विज्ञापन जाँचें",gen:"सुधारा हुआ विज्ञापन बनाएँ",genning:"सुधारा हुआ विज्ञापन लिखा जा रहा है...",fixedH:"सुधारा हुआ विज्ञापन",headline:"शीर्षक",body:"मुख्य पाठ",cta:"कॉल टू एक्शन",fine:"छोटे अक्षरों की शर्तें",design:"ज़रूरी डिज़ाइन बदलाव",changes:"क्या बदला गया",copyAd:"सुधारा विज्ञापन कॉपी करें",dl:".txt डाउनलोड करें",regen:"फिर से बनाएँ",aiNote:"यह AI ने आपके नियमों के आधार पर लिखा है। उपयोग से पहले किसी व्यक्ति को इसकी समीक्षा करनी चाहिए।",rerun:"भाषा बदली गई है। इस भाषा में नतीजा पाने के लिए फिर से \"विज्ञापन जाँचें\" दबाएँ।",problem:"समस्या",fix:"सुधार",adLabel:"विज्ञापन",resLabel:"नतीजा",img:"AI से बना सुधारा हुआ विज्ञापन",imgWorking:"सुधारे हुए विज्ञापन की तस्वीर बन रही है... इसमें एक मिनट तक लग सकता है",imgDl:"तस्वीर डाउनलोड करें",imgRegen:"तस्वीर फिर से बनाएँ",imgNote:"यह AI से बनी तस्वीर है। उपयोग से पहले इसके हर शब्द को ध्यान से जाँचें।"},
+    zh:{PASS:"通过",FAIL:"未通过",failOne:"请修改 1 处，然后重新检查",failMany:"请修改 {n} 处，然后重新检查",failNone:"该广告违反了公司规定",failSub:"每张卡片显示相关规定、广告中的问题以及修改方法。",howFix:"修改方法：",defFix:"修改广告使其不再违反此规定，然后重新检查。",copyFix:"复制修改清单",copied:"已复制",again:"上传修改后的广告",passTitle:"该广告符合公司规定",looked:"检查器查看的规定：",humanH:"请人工核实",humanP:"AI 可能会有疏漏。请在新标签页中打开清单，由人工逐项确认并签字。",openList:"打开人工审核清单",took:"检查用时 {s} 秒。",reading:"正在对照规定阅读广告...",slow:"（耗时比平时长）",checking:"检查中...",checkBtn:"检查广告",gen:"生成修正后的广告",genning:"正在撰写修正后的广告...",fixedH:"修正后的广告",headline:"标题",body:"正文",cta:"行动号召",fine:"细则说明",design:"需要的设计修改",changes:"修改内容",copyAd:"复制修正后的广告",dl:"下载 .txt",regen:"重新生成",aiNote:"由 AI 根据您的规定撰写，使用前请由人工审核。",rerun:"语言已更改。请再次点击“检查广告”以用此语言获取结果。",problem:"问题",fix:"修改",adLabel:"广告",resLabel:"结果",img:"AI 生成的修正后广告",imgWorking:"正在生成修正后的广告图片...最长可能需要一分钟",imgDl:"下载图片",imgRegen:"重新生成图片",imgNote:"此图片由 AI 生成，使用前请仔细检查其中每个字。"},
+    ja:{PASS:"合格",FAIL:"不合格",failOne:"1 件を修正してから、もう一度チェックしてください",failMany:"{n} 件を修正してから、もう一度チェックしてください",failNone:"この広告は社内ルールに違反しています",failSub:"各カードに、ルール、広告のどこが問題か、修正方法が表示されます。",howFix:"修正方法：",defFix:"このルールに違反しないよう広告を修正し、もう一度チェックしてください。",copyFix:"修正リストをコピー",copied:"コピーしました",again:"修正した広告をアップロード",passTitle:"この広告は社内ルールに適合しています",looked:"チェックしたルール：",humanH:"担当者による確認を行いましょう",humanP:"AI は見落とすことがあります。新しいタブでチェックリストを開き、担当者が各項目を確認して承認してください。",openList:"人による確認チェックリストを開く",took:"{s} 秒でチェックしました。",reading:"ルールに照らして広告を確認しています...",slow:"（通常より時間がかかっています）",checking:"チェック中...",checkBtn:"広告をチェック",gen:"修正版の広告を生成",genning:"修正版の広告を作成中...",fixedH:"修正版の広告",headline:"見出し",body:"本文",cta:"行動喚起",fine:"注意書き",design:"必要なデザイン変更",changes:"変更点",copyAd:"修正版をコピー",dl:".txt をダウンロード",regen:"もう一度生成",aiNote:"AI があなたのルールに基づいて作成しました。使用前に担当者が確認してください。",rerun:"言語が変更されました。この言語で結果を得るには、もう一度「広告をチェック」を押してください。",problem:"問題",fix:"修正",adLabel:"広告",resLabel:"結果",img:"AI が生成した修正版広告",imgWorking:"修正版の広告画像を生成中...最大 1 分ほどかかります",imgDl:"画像をダウンロード",imgRegen:"画像を再生成",imgNote:"AI 生成画像です。使用前に文字をひとつずつ確認してください。"},
+    de:{PASS:"BESTANDEN",FAIL:"DURCHGEFALLEN",failOne:"1 Punkt beheben, dann erneut prüfen",failMany:"{n} Punkte beheben, dann erneut prüfen",failNone:"Diese Anzeige verstößt gegen die Unternehmensregeln",failSub:"Jede Karte zeigt die Regel, was in Ihrer Anzeige falsch ist und wie Sie es beheben.",howFix:"So beheben Sie es: ",defFix:"Ändern Sie die Anzeige so, dass sie diese Regel nicht mehr verletzt, und prüfen Sie erneut.",copyFix:"Korrekturliste kopieren",copied:"Kopiert",again:"Korrigierte Anzeige hochladen",passTitle:"Diese Anzeige entspricht den Unternehmensregeln",looked:"Vom Prüfer berücksichtigte Regeln:",humanH:"Von einer Person prüfen lassen",humanP:"Eine KI kann etwas übersehen. Öffnen Sie die Checkliste in einem neuen Tab, damit eine Person jeden Punkt bestätigt und abzeichnet.",openList:"Checkliste für die menschliche Prüfung öffnen",took:"Geprüft in {s} Sekunden.",reading:"Die Anzeige wird anhand der Regeln gelesen...",slow:"(dauert länger als üblich)",checking:"Wird geprüft...",checkBtn:"Anzeige prüfen",gen:"Korrigierte Anzeige erstellen",genning:"Korrigierte Anzeige wird geschrieben...",fixedH:"Korrigierte Anzeige",headline:"Überschrift",body:"Haupttext",cta:"Handlungsaufforderung",fine:"Kleingedrucktes",design:"Nötige Design-Änderungen",changes:"Was geändert wurde",copyAd:"Korrigierte Anzeige kopieren",dl:".txt herunterladen",regen:"Neu erstellen",aiNote:"Von einer KI anhand Ihrer Regeln geschrieben. Vor der Verwendung sollte eine Person sie prüfen.",rerun:"Die Sprache wurde geändert. Klicken Sie erneut auf „Anzeige prüfen“, um das Ergebnis in dieser Sprache zu erhalten.",problem:"Problem",fix:"Lösung",adLabel:"Anzeige",resLabel:"Ergebnis",img:"KI-generierte korrigierte Anzeige",imgWorking:"Bild der korrigierten Anzeige wird erzeugt ... das kann bis zu einer Minute dauern",imgDl:"Bild herunterladen",imgRegen:"Bild neu erstellen",imgNote:"KI-generiertes Bild. Prüfen Sie jedes Wort darin sorgfältig, bevor Sie es verwenden."},
+    ru:{PASS:"ПРОЙДЕНО",FAIL:"НЕ ПРОЙДЕНО",failOne:"Нужно исправить 1 пункт, затем проверьте снова",failMany:"Нужно исправить: {n}, затем проверьте снова",failNone:"Это объявление нарушает правила компании",failSub:"На каждой карточке указаны правило, что не так в объявлении и как это исправить.",howFix:"Как исправить: ",defFix:"Измените объявление так, чтобы оно не нарушало это правило, и проверьте снова.",copyFix:"Скопировать список исправлений",copied:"Скопировано",again:"Загрузить исправленное объявление",passTitle:"Это объявление соответствует правилам компании",looked:"Правила, по которым шла проверка:",humanH:"Пусть проверит человек",humanP:"ИИ может что-то упустить. Откройте чек-лист в новой вкладке, чтобы человек подтвердил каждый пункт и поставил подпись.",openList:"Открыть чек-лист проверки человеком",took:"Проверено за {s} с.",reading:"Объявление сверяется с правилами...",slow:"(дольше обычного)",checking:"Проверка...",checkBtn:"Проверить объявление",gen:"Создать исправленное объявление",genning:"Пишется исправленное объявление...",fixedH:"Исправленное объявление",headline:"Заголовок",body:"Основной текст",cta:"Призыв к действию",fine:"Мелкий шрифт",design:"Необходимые изменения дизайна",changes:"Что изменено",copyAd:"Скопировать исправленное объявление",dl:"Скачать .txt",regen:"Создать заново",aiNote:"Написано ИИ на основе ваших правил. Перед использованием его должен проверить человек.",rerun:"Язык изменён. Нажмите «Проверить объявление» ещё раз, чтобы получить результат на этом языке.",problem:"Проблема",fix:"Исправление",adLabel:"Объявление",resLabel:"Результат",img:"Исправленное объявление, созданное ИИ",imgWorking:"Создаётся изображение исправленного объявления... это может занять до минуты",imgDl:"Скачать изображение",imgRegen:"Создать изображение заново",imgNote:"Изображение создано ИИ. Перед использованием внимательно проверьте каждое слово."}
   };
   var LANG="en", busy=false, last=null;
   try{ LANG=localStorage.getItem("bg-lang")||"en"; }catch(e){}
@@ -1146,6 +1266,8 @@ h1.wordmark{font-weight:800;letter-spacing:-.045em;line-height:1}
     if(f.call_to_action) ad.appendChild(h("span",{class:"ad-cta",text:f.call_to_action}));
     if(f.fine_print) ad.appendChild(h("p",{class:"ad-fine",text:f.fine_print}));
     card.appendChild(ad);
+    var imgBox=h("div",{class:"imgbox"});
+    card.appendChild(imgBox);
     function list(title,items){
       if(!items.length) return;
       var ul=h("ul",{class:"fixlist"});
@@ -1166,6 +1288,36 @@ h1.wordmark{font-weight:800;letter-spacing:-.045em;line-height:1}
     card.appendChild(h("p",{class:"fine",text:t("aiNote")}));
     out.appendChild(card);
     card.scrollIntoView({block:"nearest",behavior:"smooth"});
+    return imgBox;
+  }
+  function generateImage(f,d,box){
+    var fd=new FormData();
+    fd.append("ad",adFile);
+    fd.append("fix",JSON.stringify(f));
+    fd.append("violations",JSON.stringify(d.violations));
+    box.textContent="";
+    box.appendChild(h("div",{class:"working"},[h("span",{class:"spin"}),h("p",{text:t("imgWorking")})]));
+    var ac=new AbortController(), killer=setTimeout(function(){ac.abort();},200000);
+    function retry(){ return h("button",{class:"btn ghost",type:"button",text:t("imgRegen"),onclick:function(){generateImage(f,d,box);}}); }
+    fetch("/api/fix-image",{method:"POST",body:fd,signal:ac.signal}).then(function(r){
+      return r.json().then(function(j){return {ok:r.ok,body:j};});
+    }).then(function(res){
+      box.textContent="";
+      if(!res.ok){
+        box.appendChild(h("p",{class:"err",text:res.body.error||"Something went wrong. Try again."}));
+        box.appendChild(retry()); return;
+      }
+      var ext=(res.body.mime||"image/png").indexOf("jpeg")>-1?"jpg":"png";
+      box.appendChild(h("h4",{class:"fl-h",text:t("img")}));
+      box.appendChild(h("img",{src:res.body.image,alt:t("img")}));
+      var dl=h("a",{class:"btn ghost",href:res.body.image,download:adFile.name.replace(/\.[^.]+$/,"")+"-corrected."+ext},[icon("download"),t("imgDl")]);
+      box.appendChild(h("div",{class:"actions"},[dl,retry()]));
+      box.appendChild(h("p",{class:"fine",text:t("imgNote")}));
+    }).catch(function(e){
+      box.textContent="";
+      box.appendChild(h("p",{class:"err",text:(e&&e.name==="AbortError")?"The image is taking too long. Try again.":"Could not reach the app. Check that it is still running, then try again."}));
+      box.appendChild(retry());
+    }).then(function(){ clearTimeout(killer); });
   }
   function generateFix(d,btn,lab,out){
     var fd=new FormData();
@@ -1182,7 +1334,7 @@ h1.wordmark{font-weight:800;letter-spacing:-.045em;line-height:1}
     }).then(function(res){
       out.textContent="";
       if(!res.ok){ out.appendChild(h("p",{class:"err",text:res.body.error||"Something went wrong. Try again."})); return; }
-      renderFix(res.body,out); lab.textContent=t("regen");
+      var imgBox=renderFix(res.body,out); lab.textContent=t("regen"); if(state.image) generateImage(res.body,d,imgBox);
     }).catch(function(e){
       out.textContent="";
       out.appendChild(h("p",{class:"err",text:(e&&e.name==="AbortError")?"This is taking too long. Try again.":"Could not reach the app. Check that it is still running, then try again."}));
