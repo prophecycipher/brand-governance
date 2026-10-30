@@ -673,9 +673,19 @@ button{font:inherit;color:inherit;cursor:pointer}
 .nav a.on{background:linear-gradient(135deg,rgba(109,93,246,.95),rgba(139,92,246,.85));color:#fff;box-shadow:0 12px 26px -14px #6D5DF6}
 .nav .ic{width:19px;height:19px}
 .sidefoot{margin-top:auto;display:grid;gap:10px}
-.user{display:flex;align-items:center;gap:11px;padding:10px 12px;border-top:1px solid var(--line);margin-top:4px}
+.user{display:flex;align-items:center;gap:11px;width:100%;padding:10px 12px;border:0;border-top:1px solid var(--line);margin-top:4px;background:none;text-align:left;border-radius:0 0 12px 12px;transition:background .2s}
+.user:hover{background:var(--panel2)}
+.user .uinfo{flex:1;min-width:0}
+.user .uinfo b,.user .uinfo small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.user .uedit{color:var(--muted);opacity:0;transition:opacity .2s}
+.user:hover .uedit,.user:focus-visible .uedit{opacity:1}
+.field{display:grid;gap:6px;margin-top:14px;font-weight:600;font-size:13px}
+.field input{height:44px;border-radius:12px;border:1px solid var(--line);background:var(--field);color:var(--ink);padding:0 14px;font:400 15px var(--body)}
+.field input:focus{border-color:var(--brand2)}
+.field .req{color:var(--fail)}
+.field .ferr{color:var(--fail);font-weight:600;min-height:0}
 .avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#6D5DF6,#FF8FB1);display:grid;place-items:center;color:#fff;font:800 14px var(--display);flex:none}
-.user b{display:block;font-size:13px;line-height:1.2}
+.user b{font-size:13px;line-height:1.2}
 .user small{color:var(--muted);font-size:12px}
 
 .main{grid-area:main;padding:26px 28px 40px;min-width:0}
@@ -1073,7 +1083,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
     </nav>
     <div class="sidefoot">
       <nav class="nav" aria-label="Settings"><a href="#settings" id="nav-settings"><span class="ic" data-i="gear"></span>Settings</a></nav>
-      <div class="user"><span class="avatar" aria-hidden="true">YS</span><div><b>Yashasvi Singh</b><small>Workspace Admin</small></div></div>
+      <button class="user" id="userBtn" type="button" aria-haspopup="dialog" title="Edit your details"><span class="avatar" id="userAv" aria-hidden="true">?</span><span class="uinfo"><b id="userName">Guest</b><small id="userSub">Add your details</small></span><span class="ic uedit" data-i="edit" aria-hidden="true"></span></button>
     </div>
   </aside>
 
@@ -1344,6 +1354,41 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
   function icon(name){ var s=document.createElement("span"); s.className="ic"; s.setAttribute("aria-hidden","true"); s.innerHTML=svgOf(name); return s; }
   Array.prototype.forEach.call(document.querySelectorAll("[data-i]"),function(el){ el.innerHTML=svgOf(el.getAttribute("data-i")); });
 
+  /* ---------- profile (saved in this browser) ---------- */
+  var profile={name:"",empId:"",email:""};
+  try{ var pj=JSON.parse(lsGet("bg-profile","null")); if(pj&&typeof pj==="object") profile={name:String(pj.name||""),empId:String(pj.empId||""),email:String(pj.email||"")}; }catch(e){}
+  function initials(n){ var w=n.trim().split(/\s+/).filter(Boolean); if(!w.length) return "?"; return (w[0].charAt(0)+(w.length>1?w[w.length-1].charAt(0):"")).toUpperCase(); }
+  function renderUser(){
+    $("userAv").textContent=initials(profile.name);
+    $("userName").textContent=profile.name||"Guest";
+    $("userSub").textContent=profile.empId?("ID: "+profile.empId):(profile.email||"Add your details");
+  }
+  function openProfile(){
+    var nameIn=h("input",{type:"text",id:"pfName",autocomplete:"name",maxlength:"80",value:profile.name,placeholder:"Your full name"});
+    var idIn=h("input",{type:"text",id:"pfId",autocomplete:"off",maxlength:"40",value:profile.empId,placeholder:"For example: EMP-1024"});
+    var mailIn=h("input",{type:"email",id:"pfMail",autocomplete:"email",maxlength:"120",value:profile.email,placeholder:"you@company.com"});
+    var err=h("p",{class:"ferr",role:"alert"});
+    var form=h("form",{novalidate:"novalidate"},[
+      h("label",{class:"field",for:"pfName"},[h("span",{},["Name ",h("span",{class:"req",text:"*"})]),nameIn]),
+      h("label",{class:"field",for:"pfId"},[h("span",{text:"Employee ID"}),idIn]),
+      h("label",{class:"field",for:"pfMail"},[h("span",{text:"Email"}),mailIn]),
+      err,
+      h("div",{class:"actions"},[h("button",{class:"btnp",type:"submit",text:"Save details"}),h("button",{class:"btn",type:"button",text:"Cancel",onclick:closeModal}),
+        (profile.name||profile.empId||profile.email)?h("button",{class:"link",type:"button",text:"Remove my details",onclick:function(){ profile={name:"",empId:"",email:""}; lsDel("bg-profile"); renderUser(); closeModal(); toast("Your details were removed."); }}):null]),
+      h("p",{class:"fine",text:"Saved only in this browser. They are used to pre-fill the reviewer name on the human review checklist."})
+    ]);
+    form.addEventListener("submit",function(e){
+      e.preventDefault();
+      var n=nameIn.value.trim(), m=mailIn.value.trim();
+      if(!n){ err.textContent="Please enter your name."; nameIn.focus(); return; }
+      if(m&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(m)){ err.textContent="Please enter a valid email address."; mailIn.focus(); return; }
+      profile={name:n,empId:idIn.value.trim(),email:m};
+      lsSet("bg-profile",JSON.stringify(profile)); renderUser(); closeModal(); toast("Details saved.");
+    });
+    openModal(h("div",{},[h("div",{class:"mh"},[h("div",{},[h("h2",{text:"Your details",style:"font-size:22px"}),h("p",{class:"sub",text:"Tell us who is using the app."})])]),form]));
+    nameIn.focus();
+  }
+
   /* ---------- toast + overlays ---------- */
   var toastT=null;
   function toast(msg){
@@ -1388,6 +1433,8 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
     openModal(node);
   }
   $("upgradeBtn").addEventListener("click",showUpgrade);
+  $("userBtn").addEventListener("click",openProfile);
+  renderUser();
 
   /* ---------- theme ---------- */
   var themeMode=lsGet("bg-theme","dark");
@@ -1569,7 +1616,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
     return out;
   }
   function reviewHref(rec){
-    var payload={ad:rec.file||rec.name,at:new Date(rec.ts).toISOString(),by:state.by,rules:rec.checked||[]};
+    var payload={ad:rec.file||rec.name,at:new Date(rec.ts).toISOString(),by:state.by,rules:rec.checked||[],reviewer:profile.name,empId:profile.empId};
     return "/review#d="+encodeURIComponent(JSON.stringify(payload));
   }
   function summaryText(rec){
@@ -2051,7 +2098,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
       d.checked.forEach(function(r){ ul.appendChild(h("li",{},[icon("check"),h("span",{text:r})])); });
       box.appendChild(ul);
     }
-    var payload={ad:adFile.name,at:new Date().toISOString(),by:state.by,rules:d.checked||[]};
+    var payload={ad:adFile.name,at:new Date().toISOString(),by:state.by,rules:d.checked||[],reviewer:profile.name,empId:profile.empId};
     var href="/review#d="+encodeURIComponent(JSON.stringify(payload));
     var link=h("a",{class:"btn green",href:href,target:"_blank",rel:"noopener"},[t("openList"),icon("external")]);
     box.appendChild(h("div",{class:"human"},[
@@ -2377,6 +2424,7 @@ h2{font:800 20px/1.2 var(--display);margin:0 0 4px}
     lists[it.g].appendChild(h("li",{},[h("label",{},[cb,h("span",{text:it.t})])]));
   });
 
+  if(!st.name&&data.reviewer) st.name=data.reviewer;
   var nameIn=h("input",{type:"text",id:"rname",autocomplete:"name",value:st.name||""});
   nameIn.addEventListener("input",function(){ st.name=nameIn.value; st.verified=false; save(); update(); });
   var verifyBtn=h("button",{class:"btn",type:"button",text:"Mark as verified"});
@@ -2408,7 +2456,7 @@ h2{font:800 20px/1.2 var(--display);margin:0 0 4px}
       seal.insertAdjacentHTML("afterbegin",'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg>');
       seal.appendChild(h("div",{},[h("strong",{text:"Verified by "+st.name.trim()}),h("span",{text:"on "+(st.when||"")+" for "+data.ad})]));
     }
-    var lines=["Human review checklist","Ad: "+data.ad,"AI result: PASS","Reviewer: "+(st.name||"(not signed)"),"Status: "+(st.verified?"Verified "+st.when:"Not yet verified"),""];
+    var lines=["Human review checklist","Ad: "+data.ad,"AI result: PASS","Reviewer: "+(st.name||"(not signed)")+(data.empId?" (Employee ID: "+data.empId+")":""),"Status: "+(st.verified?"Verified "+st.when:"Not yet verified"),""];
     items.forEach(function(it,i){ lines.push((st.ticks[i]?"[x] ":"[ ] ")+it.t); });
     mailLink.setAttribute("href","mailto:?subject="+encodeURIComponent("Human review: "+data.ad)+"&body="+encodeURIComponent(lines.join("\n")));
   }
