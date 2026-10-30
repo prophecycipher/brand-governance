@@ -10,6 +10,11 @@ Run:
 Then open http://127.0.0.1:5000
 
 The API key stays on your computer (server side). The browser never sees it.
+
+Saving checks per employee (optional):
+    By default each employee's checks are saved on the server's disk (folder bg_data, or BG_DATA_DIR).
+    To save them in YOUR Google Drive instead, deploy drive_backend.gs as a Google Apps Script web app,
+    then set DRIVE_SCRIPT_URL (the web app URL) and DRIVE_SCRIPT_TOKEN (the same secret as in the script).
 """
 
 import base64
@@ -18,7 +23,10 @@ import io
 import json
 import mimetypes
 import os
+import re
+import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
@@ -482,13 +490,209 @@ def lang_from_request():
     return lang if lang in LANGUAGES else "en"
 
 
+# ---------------------------------------------------------- per-employee storage
+# Each employee's checks are saved in one small JSON document. The document is found
+# by a hash of (employee ID + email), so file names never contain personal details.
+#   - If DRIVE_SCRIPT_URL and DRIVE_SCRIPT_TOKEN are set, documents are stored in YOUR
+#     Google Drive through a tiny Google Apps Script web app (see drive_backend.gs).
+#   - Otherwise they are stored as files in BG_DATA_DIR on the server's disk.
+MAX_HISTORY = 100
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+class StoreError(Exception):
+    pass
+
+
+class LocalStore:
+    kind = "local"
+
+    def __init__(self, folder):
+        self.folder = Path(folder)
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        path = self.folder / f"{key}.json"
+        with self.lock:
+            if not path.exists():
+                return None
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raise StoreError("Could not read the saved data.")
+
+    def put(self, key, doc):
+        with self.lock:
+            try:
+                self.folder.mkdir(parents=True, exist_ok=True)
+                tmp = self.folder / f"{key}.tmp"
+                tmp.write_text(json.dumps(doc), encoding="utf-8")
+                tmp.replace(self.folder / f"{key}.json")
+            except OSError:
+                raise StoreError("Could not write the saved data.")
+
+
+class DriveStore:
+    """Talks to a Google Apps Script web app that reads and writes files in your Drive."""
+
+    kind = "drive"
+
+    def __init__(self, url, token):
+        self.url = url
+        self.token = token
+
+    def _call(self, payload):
+        payload = dict(payload, token=self.token)
+        req = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "text/plain;charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                out = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            raise StoreError(f"Google Drive could not be reached: {str(e)[:120]}")
+        if not isinstance(out, dict) or not out.get("ok"):
+            raise StoreError("Google Drive refused the request. Check the script URL and token.")
+        return out
+
+    def get(self, key):
+        return self._call({"action": "get", "key": key}).get("doc")
+
+    def put(self, key, doc):
+        self._call({"action": "put", "key": key, "doc": doc})
+
+
+_STORE = None
+
+
+def store():
+    global _STORE
+    if _STORE is None:
+        url = os.environ.get("DRIVE_SCRIPT_URL", "").strip()
+        token = os.environ.get("DRIVE_SCRIPT_TOKEN", "").strip()
+        if url and token:
+            _STORE = DriveStore(url, token)
+        else:
+            _STORE = LocalStore(os.environ.get("BG_DATA_DIR", "bg_data"))
+    return _STORE
+
+
+def _clip(v, n):
+    return str(v if v is not None else "").strip()[:n]
+
+
+def identity_from(body):
+    emp = _clip(body.get("empId"), 40)
+    email = _clip(body.get("email"), 120).lower()
+    name = _clip(body.get("name"), 80)
+    if not emp or not EMAIL_RE.match(email):
+        raise UserError("Enter your Employee ID and a valid email to save your checks.")
+    key = hashlib.sha256(f"{emp.lower()}|{email}".encode("utf-8")).hexdigest()[:40]
+    return key, {"name": name, "empId": emp, "email": email}
+
+
+def clean_record(r):
+    """Keep only the fields we expect, so the saved file stays small and predictable."""
+    if not isinstance(r, dict):
+        return None
+    verdict = str(r.get("verdict", "")).upper()
+    if verdict not in ("PASS", "FAIL"):
+        return None
+    try:
+        ts = int(r.get("ts"))
+    except (TypeError, ValueError):
+        return None
+    viol = []
+    for v in (r.get("violations") or [])[:20]:
+        if isinstance(v, dict):
+            sev = _clip(v.get("severity"), 10).lower()
+            viol.append({
+                "rule": _clip(v.get("rule"), 300), "reason": _clip(v.get("reason"), 600),
+                "fix": _clip(v.get("fix"), 600), "severity": sev if sev in ("high", "medium", "low") else "medium",
+            })
+    thumb = r.get("thumbS")
+    if not (isinstance(thumb, str) and thumb.startswith("data:image/jpeg;base64,") and len(thumb) <= 30000):
+        thumb = None
+    try:
+        seconds = float(r.get("seconds") or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    return {
+        "id": _clip(r.get("id"), 40), "name": _clip(r.get("name"), 120), "file": _clip(r.get("file"), 200),
+        "ts": ts, "verdict": verdict, "seconds": seconds,
+        "checked": [_clip(c, 200) for c in (r.get("checked") or [])[:12]],
+        "violations": viol, "thumbS": thumb, "demo": False,
+    }
+
+
+def merge_history(old, new):
+    by_id = {}
+    for r in list(old or []) + list(new or []):
+        if isinstance(r, dict) and r.get("id"):
+            by_id[r["id"]] = r
+    return sorted(by_id.values(), key=lambda r: r.get("ts", 0), reverse=True)[:MAX_HISTORY]
+
+
+def body_json():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        raise UserError("Bad request.")
+    return body
+
+
+def sync_error(e):
+    if isinstance(e, UserError):
+        return jsonify({"error": str(e)}), 400
+    if isinstance(e, StoreError):
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"error": "Saving did not work. Your checks are still saved in this browser."}), 502
+
+
+@app.post("/api/sync/login")
+def sync_login():
+    """Look up an employee by ID + email, and return their saved checks."""
+    try:
+        body = body_json()
+        key, who = identity_from(body)
+        doc = store().get(key)
+        return jsonify({
+            "ok": True, "storage": store().kind, "existed": bool(doc),
+            "profile": (doc or {}).get("profile") or who,
+            "history": (doc or {}).get("history") or [],
+        })
+    except Exception as e:
+        return sync_error(e)
+
+
+@app.post("/api/sync/save")
+def sync_save():
+    """Add one or more checks to an employee's saved history."""
+    try:
+        body = body_json()
+        key, who = identity_from(body)
+        incoming = [clean_record(r) for r in (body.get("records") or [])[:MAX_HISTORY]]
+        incoming = [r for r in incoming if r and r["id"]]
+        doc = store().get(key) or {"profile": who, "history": []}
+        if who["name"]:
+            doc["profile"] = who
+        doc["history"] = merge_history(doc.get("history"), incoming)
+        doc["updated"] = int(time.time() * 1000)
+        store().put(key, doc)
+        return jsonify({"ok": True, "storage": store().kind, "count": len(doc["history"])})
+    except Exception as e:
+        return sync_error(e)
+
+
 # ------------------------------------------------------------------ routes
 @app.get("/api/status")
 def status():
     which = provider()
     name = "brand-governance"
     by = {"gemini": "Google Gemini", "claude": "Claude"}.get(which, "AI")
-    return jsonify({"provider": which, "name": name, "by": by, "languages": LANGUAGES, "image": which == "gemini"})
+    return jsonify({"provider": which, "name": name, "by": by, "languages": LANGUAGES, "image": which == "gemini", "storage": store().kind})
 
 
 @app.post("/api/check")
@@ -646,7 +850,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 .app{display:grid;grid-template-columns:236px minmax(0,1fr);grid-template-areas:"top top" "side main";min-height:100vh}
 .top{grid-area:top;display:flex;align-items:center;gap:14px;padding:12px 22px 12px 18px;position:sticky;top:0;z-index:30;
   background:var(--side);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);border-bottom:1px solid var(--line)}
-.brandb{display:flex;align-items:center;gap:10px;width:206px;flex:none;text-decoration:none;color:var(--ink);font:800 17px var(--display);letter-spacing:-.02em}
+.brandb{display:flex;align-items:center;gap:10px;width:226px;white-space:nowrap;flex:none;text-decoration:none;color:var(--ink);font:800 17px var(--display);letter-spacing:-.02em}
 
 .search{position:relative;flex:1;max-width:560px}
 .search input{width:100%;height:40px;border-radius:12px;border:1px solid var(--line);background:var(--field);color:var(--ink);padding:0 64px 0 40px;font:inherit}
@@ -684,8 +888,12 @@ button{font:inherit;color:inherit;cursor:pointer}
 .field input:focus{border-color:var(--brand2)}
 .field .req{color:var(--fail)}
 .field .ferr{color:var(--fail);font-weight:600;min-height:0}
-.avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#6D5DF6,#FF8FB1);display:grid;place-items:center;color:#fff;font:800 14px var(--display);flex:none}
+.avatar{position:relative;width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#6D5DF6,#FF8FB1);display:grid;place-items:center;color:#fff;font:800 14px var(--display);flex:none}
 .user b{font-size:13px;line-height:1.2}
+.avatar[data-sync]::after{content:"";position:absolute;right:-2px;bottom:-2px;width:12px;height:12px;border-radius:50%;border:2px solid var(--bg);background:var(--muted)}
+.avatar[data-sync=ok]::after{background:var(--pass)}
+.avatar[data-sync=syncing]::after{background:var(--warn);animation:ping 1.4s ease-out infinite}
+.avatar[data-sync=error]::after{background:var(--fail)}
 .user small{color:var(--muted);font-size:12px}
 
 .main{grid-area:main;padding:26px 28px 40px;min-width:0}
@@ -1266,9 +1474,11 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
         </div></div>
       <div class="setrow"><div><b>Show sample data</b><small>Fills the dashboard with example verifications and stats. Turn it off to see only your own checks.</small></div>
         <button class="switch" id="demoSw" type="button" role="switch" aria-checked="true" aria-label="Show sample data"></button></div>
+      <div class="setrow"><div><b>Saving across devices</b><small id="cloudInfo">Checking...</small></div>
+        <button class="btn" id="syncBtn" type="button">Sync now</button></div>
       <div class="setrow"><div><b>AI provider</b><small id="provInfo">Checking...</small></div></div>
       <div class="setrow"><div><b>Verdict language</b><small>Use the globe menu in the top bar to change the language of verdicts.</small></div></div>
-      <div class="setrow"><div><b>Clear my verification history</b><small>Removes the checks saved in this browser. Your saved rules stay.</small></div>
+      <div class="setrow"><div><b>Clear my verification history</b><small>Removes your checks from this browser. If saving across devices is on, they come back at the next sync. Your saved rules stay.</small></div>
         <button class="btn" id="clearHist" type="button">Clear history</button></div>
       <div class="setrow"><div><b>Remove saved company rules</b><small>Deletes the rules saved in this browser.</small></div>
         <button class="btn" id="clearRules" type="button">Remove rules</button></div>
@@ -1374,16 +1584,26 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
       h("label",{class:"field",for:"pfMail"},[h("span",{text:"Email"}),mailIn]),
       err,
       h("div",{class:"actions"},[h("button",{class:"btnp",type:"submit",text:"Save details"}),h("button",{class:"btn",type:"button",text:"Cancel",onclick:closeModal}),
-        (profile.name||profile.empId||profile.email)?h("button",{class:"link",type:"button",text:"Remove my details",onclick:function(){ profile={name:"",empId:"",email:""}; lsDel("bg-profile"); renderUser(); closeModal(); toast("Your details were removed."); }}):null]),
-      h("p",{class:"fine",text:"Saved only in this browser. They are used to pre-fill the reviewer name on the human review checklist."})
+        (profile.name||profile.empId||profile.email)?h("button",{class:"link",type:"button",text:"Remove my details",onclick:function(){ profile={name:"",empId:"",email:""}; lsDel("bg-profile"); renderUser(); real=loadHist(); cloud.state="off"; renderCloud(); closeModal(); toast("Your details were removed."); rerender(); }}):null]),
+      h("p",{class:"fine",text:"Your details stay in this browser. Add your Employee ID and email to save your checks under them and see them again on any device. They also pre-fill the reviewer name on the human review checklist."})
     ]);
     form.addEventListener("submit",function(e){
       e.preventDefault();
       var n=nameIn.value.trim(), m=mailIn.value.trim();
       if(!n){ err.textContent="Please enter your name."; nameIn.focus(); return; }
       if(m&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(m)){ err.textContent="Please enter a valid email address."; mailIn.focus(); return; }
+      var prevKey=histKey();
       profile={name:n,empId:idIn.value.trim(),email:m};
-      lsSet("bg-profile",JSON.stringify(profile)); renderUser(); closeModal(); toast("Details saved.");
+      lsSet("bg-profile",JSON.stringify(profile)); renderUser();
+      var newKey=histKey();
+      if(newKey!==prevKey){
+        var guest=(prevKey==="bg-history")?loadHist("bg-history"):[];
+        real=loadHist(newKey);
+        if(guest.length){ real=mergeById(real,guest); lsSet("bg-history","[]"); saveReal(); }
+      }
+      closeModal();
+      if(canSync()){ toast("Details saved. Syncing your checks..."); syncAll(false); } else toast("Details saved.");
+      rerender();
     });
     openModal(h("div",{},[h("div",{class:"mh"},[h("div",{},[h("h2",{text:"Your details",style:"font-size:22px"}),h("p",{class:"sub",text:"Tell us who is using the app."})])]),form]));
     nameIn.focus();
@@ -1491,7 +1711,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
   function scoreColor(s){ return s>=80?"var(--pass)":s>=50?"var(--warn)":"var(--fail)"; }
   function hueOf(str){ var x=0; for(var i=0;i<str.length;i++) x=(x*31+str.charCodeAt(i))%360; return x; }
   function thumbEl(rec,size){
-    if(rec.thumb){ var im=h("img",{class:"thumb",src:rec.thumb,alt:""}); return im; }
+    if(rec.thumb||rec.thumbS){ var im=h("img",{class:"thumb",src:rec.thumb||rec.thumbS,alt:""}); return im; }
     var hu=rec.hue!=null?rec.hue:hueOf(rec.name||"x");
     var d=h("div",{class:"thumb"}); d.style.background="linear-gradient(135deg,hsl("+hu+",70%,52%),hsl("+((hu+50)%360)+",75%,38%))";
     d.innerHTML=svgOf(/\.pdf$/i.test(rec.file||"")?"file":"image"); return d;
@@ -1511,14 +1731,83 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
 
   /* ---------- data: real history + sample data ---------- */
   var DEMO_ON=lsGet("bg-demo","1")==="1";
-  var real=[]; try{ real=JSON.parse(lsGet("bg-history","[]"))||[]; }catch(e){ real=[]; }
+  function canSync(){ return !!(profile.empId&&profile.email); }
+  function histKey(){ return canSync()?("bg-history-"+profile.empId.toLowerCase()+"|"+profile.email.toLowerCase()):"bg-history"; }
+  function loadHist(key){ try{ var a=JSON.parse(lsGet(key||histKey(),"[]")); return Array.isArray(a)?a:[]; }catch(e){ return []; } }
+  var real=loadHist();
   function saveReal(){
+    var k=histKey();
     for(var guard=0; guard<60; guard++){
-      if(lsSet("bg-history",JSON.stringify(real))) return;
+      if(lsSet(k,JSON.stringify(real))) return;
       if(real.length<=1) return;
       real.pop();
     }
   }
+  function mergeById(a,b){
+    var m={};
+    a.concat(b).forEach(function(r){ if(r&&r.id){ var o=m[r.id]; m[r.id]=o?Object.assign({},r,o):r; } });
+    return Object.keys(m).map(function(k){ return m[k]; }).sort(function(x,y){ return y.ts-x.ts; }).slice(0,100);
+  }
+  function rerender(){
+    var n=(location.hash||"#home").slice(1);
+    if(n==="home") renderHome(); else if(n==="history") renderHistory(); else if(n==="reports") renderReports();
+    updateDot();
+  }
+
+  /* ---------- saving across devices (by Employee ID + email) ---------- */
+  var cloud={storage:null,state:"off",last:0};
+  function postJson(url,body){
+    return fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){
+      return r.json().then(function(j){ return {ok:r.ok,body:j}; });
+    });
+  }
+  function slim(r){ return {id:r.id,name:r.name,file:r.file,ts:r.ts,verdict:r.verdict,seconds:r.seconds,checked:r.checked,violations:r.violations,thumbS:r.thumbS||null}; }
+  function renderCloud(){
+    var av=$("userAv"), info=$("cloudInfo"), btn=$("syncBtn");
+    if(!canSync()){ av.removeAttribute("data-sync"); info.textContent="Off. Click your name in the sidebar and add your Employee ID and email to save your checks under your account and see them on any device."; btn.disabled=true; return; }
+    av.setAttribute("data-sync",cloud.state); btn.disabled=cloud.state==="syncing";
+    var where=cloud.storage==="drive"?"Google Drive":"the app's server (Google Drive is not connected yet)";
+    var when=cloud.last?(" Last synced "+ago(cloud.last)+"."):"";
+    info.textContent=cloud.state==="syncing"?"Syncing...":cloud.state==="error"?"Could not reach cloud storage. Your checks are safe in this browser and will sync later.":"Saved to "+where+" under "+profile.empId+"."+when;
+  }
+  function syncAll(quiet){
+    if(!canSync()){ cloud.state="off"; renderCloud(); return Promise.resolve(); }
+    var who={name:profile.name,empId:profile.empId,email:profile.email}, key=histKey();
+    cloud.state="syncing"; renderCloud();
+    return postJson("/api/sync/login",who).then(function(res){
+      if(!res.ok) throw new Error(res.body.error||"failed");
+      if(key!==histKey()) return;
+      cloud.storage=res.body.storage;
+      var srv=res.body.history||[], onSrv={}; srv.forEach(function(r){ onSrv[r.id]=1; });
+      var before=real.length;
+      real=mergeById(real,srv); saveReal();
+      var got=real.length-before;
+      var missing=real.filter(function(r){ return !onSrv[r.id]; });
+      var nameChanged=(res.body.profile&&res.body.profile.name)!==profile.name;
+      var chain=Promise.resolve();
+      if(missing.length||nameChanged){
+        for(var i=0;i<Math.max(1,missing.length);i+=25){
+          (function(chunk){ chain=chain.then(function(){ return postJson("/api/sync/save",{name:profile.name,empId:profile.empId,email:profile.email,records:chunk.map(slim)}).then(function(r2){ if(!r2.ok) throw new Error(r2.body.error||"failed"); }); }); })(missing.slice(i,i+25));
+        }
+      }
+      return chain.then(function(){
+        cloud.state="ok"; cloud.last=Date.now(); renderCloud(); rerender();
+        if(!quiet) toast(got>0?("Loaded "+got+" earlier check"+(got===1?"":"s")+" from your saved account."):(res.body.existed?"Your saved account is up to date.":"Saving is on. Your checks will be saved under "+profile.empId+"."));
+      });
+    }).catch(function(e){
+      cloud.state="error"; renderCloud();
+      if(!quiet) toast(/Employee ID|email/.test(e.message)?e.message:"Could not reach cloud storage. Your checks are still saved in this browser.");
+    });
+  }
+  function pushRecord(rec){
+    if(!canSync()) return;
+    var key=histKey();
+    postJson("/api/sync/save",{name:profile.name,empId:profile.empId,email:profile.email,records:[slim(rec)]}).then(function(res){
+      if(!res.ok) throw new Error(res.body.error||"failed");
+      if(key===histKey()){ cloud.state="ok"; cloud.last=Date.now(); cloud.storage=res.body.storage||cloud.storage; renderCloud(); }
+    }).catch(function(){ if(key===histKey()){ cloud.state="error"; renderCloud(); } });
+  }
+  $("syncBtn").addEventListener("click",function(){ syncAll(false); });
   var VB={
     claim:{rule:"Unsupported claim",reason:'The ad claims "100% Natural" without approved evidence.',fix:"Remove the claim, or add approved proof and the substantiation line required by the claims policy.",severity:"high"},
     disc:{rule:"Missing mandatory disclaimer",reason:"Health related claims require a disclaimer, and none is shown.",fix:"Add the approved health disclaimer in the footer of the ad.",severity:"high"},
@@ -1626,7 +1915,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
   }
   function adImage(rec){
     var box=h("div",{class:"vimg"});
-    if(rec.thumb) box.appendChild(h("img",{src:rec.thumb,alt:"The ad that was checked"}));
+    if(rec.thumb||rec.thumbS) box.appendChild(h("img",{src:rec.thumb||rec.thumbS,alt:"The ad that was checked"}));
     else if(rec.sample) box.innerHTML=sampleAdSvg();
     else { var th=thumbEl(rec); th.style.width="100%"; th.style.height="100%"; th.style.borderRadius="0"; box.appendChild(th); }
     return box;
@@ -1842,7 +2131,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
 
   /* ---------- status ---------- */
   fetch("/api/status").then(function(r){return r.json()}).then(function(s){
-    state.provider=s.provider; state.by=s.by; state.image=!!s.image;
+    state.provider=s.provider; state.by=s.by; state.image=!!s.image; cloud.storage=s.storage; renderCloud();
     $("appname").textContent=s.name; document.title=s.name;
     var pi=$("provInfo");
     pi.textContent=(s.provider==="gemini"?"Google Gemini":s.provider==="claude"?"Anthropic Claude":"No API key set")+
@@ -2117,12 +2406,13 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
       if(!f||f.type.indexOf("image/")!==0) return res(null);
       var u=URL.createObjectURL(f), im=new Image();
       im.onload=function(){
-        try{
-          var w=360, s=Math.min(1,w/im.width), c=document.createElement("canvas");
+        function scaled(w,q){
+          var s=Math.min(1,w/im.width), c=document.createElement("canvas");
           c.width=Math.max(1,Math.round(im.width*s)); c.height=Math.max(1,Math.round(im.height*s));
           c.getContext("2d").drawImage(im,0,0,c.width,c.height);
-          res(c.toDataURL("image/jpeg",.72));
-        }catch(e){ res(null); }
+          return c.toDataURL("image/jpeg",q);
+        }
+        try{ res({big:scaled(360,.72),small:scaled(140,.6)}); }catch(e){ res(null); }
         URL.revokeObjectURL(u);
       };
       im.onerror=function(){ URL.revokeObjectURL(u); res(null); };
@@ -2135,7 +2425,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
       violations:(d.violations||[]).map(function(v){ return {rule:v.rule,reason:v.reason,fix:v.fix,severity:v.severity||"medium"}; })};
     real.unshift(rec); if(real.length>40) real.length=40;
     saveReal(); updateDot();
-    makeThumb(file).then(function(th){ if(th){ rec.thumb=th; saveReal(); } });
+    makeThumb(file).then(function(th){ if(th){ rec.thumb=th.big; rec.thumbS=th.small; saveReal(); } pushRecord(rec); });
   }
   go.addEventListener("click",function(){
     var fd=new FormData(), sentAd=adFile;
@@ -2271,7 +2561,7 @@ canvas#net{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-event
 
   /* ---------- start ---------- */
   go.textContent=t("checkBtn");
-  emptyState(); updateDot(); route();
+  emptyState(); updateDot(); route(); renderCloud(); if(canSync()) syncAll(true);
 })();
 </script>
 </body>
